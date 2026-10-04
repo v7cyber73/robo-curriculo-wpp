@@ -41,12 +41,13 @@ async function startBot(){
     for(const m of up.messages){
       if(!m.message) continue
       const jid=m.key.remoteJid
-      if(!jid || jid.includes('@g.us') || jid.includes('@lid') || m.key.fromMe) continue
+      if(!jid || jid.includes('@g.us') || m.key.fromMe) continue  // REMOVIDO filtro @lid para permitir mensagens novas
       const txt=(m.message.conversation || m.message.extendedTextMessage?.text || '').trim()
       if(!txt) continue
+      log(`📩 Mensagem de ${jid}: ${txt.substring(0,50)}`)
       const lower=txt.toLowerCase()
       
-      const gatilho = lower.includes('criar curriculum') || lower.includes('criar curriculo') || lower.includes('criar currículo') || lower === 'curriculum' || lower === 'curriculo' || lower.includes('curriculo');
+      const gatilho = lower.includes('criar') || lower.includes('curriculo') || lower.includes('curriculum') || lower.includes('currículo') || lower === 'oi' || lower === 'ola';
       if(gatilho){
         sessions.set(jid, { step: 'nome', data: { experiencias: [], cursos: [] }, expTemp: {}, cursoTemp: {} })
         await sock.sendMessage(jid, {text:`👋 Olá! Sou o Robô da Conexão v7cyber 🤖
