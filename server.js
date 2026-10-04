@@ -152,12 +152,36 @@ async function startBot(){
       
       log(`📩 Mensagem de ${jid}: ${txt.substring(0,60)}`)
       
+      // FUNÇÃO SAIR / CANCELAR A QUALQUER MOMENTO
+      const comandosSair = ['sair','cancelar','parar','desistir','exit','cancel','stop','sai','cancela']
+      if(comandosSair.includes(lower) || lower.includes('quero sair') || lower.includes('quero cancelar')){
+        const sess = sessions.get(jid)
+        if(sess && sess.step!=='idle'){
+          sessions.delete(jid)
+          log(`🚪 ${jid} cancelou o preenchimento`)
+          await sock.sendMessage(jid, {text:`❌ Cadastro cancelado com sucesso!
+
+Se quiser recomeçar, digite *Criar Curriculum*
+
+🤖 Conexão v7cyber`})
+        } else {
+          await sock.sendMessage(jid, {text:`👋 Você não está em nenhum cadastro no momento.
+
+Digite *Criar Curriculum* para começar um novo currículo.
+
+🤖 Conexão v7cyber`})
+        }
+        continue
+      }
+
       const gatilho = lower.includes('criar curriculum') || lower.includes('criar curriculo') || lower.includes('criar currículo') || lower.includes('criar') && lower.includes('curric') || lower==='curriculo' || lower==='curriculum'
       if(gatilho){
         sessions.set(jid, { step: 'nome', data: { experiencias: [], cursos: [] }, expTemp: {}, cursoTemp: {} })
         await sock.sendMessage(jid, {text:`👋 Olá! Sou o Robô da Conexão v7cyber 🤖
 
 Vamos montar seu currículo profissional!
+
+💡 Dica: A qualquer momento digite *sair* ou *cancelar* para cancelar
 
 1️⃣ Qual seu nome e sobrenome completo?`})
         continue
@@ -395,12 +419,14 @@ ${d.nome}
 📧 Email: ${d.email}
 📱 Tel: ${d.telefone}
 
-🚀 Conexão v7cyber agradece!` })
+🚀 Conexão v7cyber agradece seu cadastro!
+
+📄 Em breve enviaremos seu currículo por PDF` })
   sessions.delete(jid)
 }
 
 startBot()
-app.get('/', (req,res)=> res.send(`<h1>Conexão v7cyber V25 - Habilidades e Resumo Opcional</h1><p>${isConnected?'✅ CONECTADO':'❌ Desconectado'}</p><a href="/whatsapp">QR WhatsApp</a> | <a href="/logs">Logs</a><pre>${logs.slice(-20).join('\n')}</pre>`))
+app.get('/', (req,res)=> res.send(`<h1>Conexão v7cyber V26 - Sair/Cancelar + PDF final</h1><p>${isConnected?'✅ CONECTADO':'❌ Desconectado'}</p><a href="/whatsapp">QR WhatsApp</a> | <a href="/logs">Logs</a><pre>${logs.slice(-20).join('\n')}</pre>`))
 app.get('/whatsapp', async (req,res)=>{
   if(isConnected) return res.send(`<body style="text-align:center;font-family:Arial;padding:40px"><h1 style="color:green">✅ CONECTADO - Conexão v7cyber</h1><p>Bot rodando - (11) 94204-7248</p><p><b>Gatilho:</b> Criar Curriculum</p><p style="background:#25D366;color:white;padding:15px;border-radius:10px">✅ Validação: CEP 00000-000 | Tel (xx) xxxxx-xxxx | Email nome@email.com</p><br><a href="/logs">Logs</a> | <a href="/clear" style="color:red">Desconectar</a><pre style="text-align:left;background:#f0f0f0;padding:10px;margin-top:20px">${logs.slice(-20).join('\n')}</pre></body>`)
   if(!qrCodeData) return res.send(`<h1>Aguardando QR...</h1><pre>${logs.slice(-10).join('\n')}</pre><script>setTimeout(()=>location.reload(),3000)</script>`)
@@ -417,6 +443,7 @@ app.get('/status', (req,res)=> res.json({connected:isConnected, hasQR:!!qrCodeDa
 app.get('/logs', (req,res)=> res.send(`<pre>${logs.join('\n')}</pre>`))
 app.get('/clear', (req,res)=>{ try{ fs.rmSync('./auth',{recursive:true,force:true}); fs.mkdirSync('./auth',{recursive:true}) }catch(e){}; qrCodeData=null; isConnected=false; res.send('Limpou - novo QR em 5s'); setTimeout(()=>startBot(),1000) })
 app.listen(PORT, ()=> log(`Rodando porta ${PORT} - V25 - Habilidades + Resumo Opcional + Estado Civil + Validacoes`))
+
 
 
 
