@@ -265,7 +265,7 @@ Ex: Ensino médio completo, Superior em Administração`}); continue } s.expTemp
           s.expTemp.fim=v.valor; d.experiencias.push({...s.expTemp}); s.expTemp={}; s.step='exp_mais'; await sock.sendMessage(jid,{text:`✅ ${d.experiencias[d.experiencias.length-1].empresa} adicionado! Tem mais empresas? sim ou não`}) }
         else if(s.step==='exp_mais'){ if(lower.startsWith('s')){ s.step='exp_empresa'; await sock.sendMessage(jid,{text:`Próxima empresa?`}) } else { s.step='formacao'; await sock.sendMessage(jid,{text:`Qual sua formação?`}) } }
         else if(s.step==='formacao'){ d.formacao=txt; s.step='curso_pergunta'; await sock.sendMessage(jid,{text:`Tem cursos? sim ou não`}) }
-        else if(s.step==='curso_pergunta'){ if(lower.startsWith('s')){ s.step='curso_nome'; await sock.sendMessage(jid,{text:`Nome do curso?`}) } else { await finalizarCurriculo(jid,d,s,sock) } }
+        else if(s.step==='curso_pergunta'){ if(lower.startsWith('s')){ s.step='curso_nome'; await sock.sendMessage(jid,{text:`Nome do curso?`}) } else { s.step='habilidades'; await sock.sendMessage(jid,{text:`💡 HABILIDADES - Opcional\n\nTem alguma habilidade para destacar?\nEx: Informática avançada, Atendimento ao cliente, Pacote Office, CNH B\n\nDigite suas habilidades ou digite *pular* para não incluir`}) } }
         else if(s.step==='curso_nome'){ s.cursoTemp.nome=txt; s.step='curso_inst'; await sock.sendMessage(jid,{text:`Onde fez ${txt}?`}) }
         else if(s.step==='curso_inst'){ s.cursoTemp.instituicao=txt; s.step='curso_ano'; await sock.sendMessage(jid,{text:`Ano do curso?\nEx: 2023\nSe não lembrar, digite *não lembro* ou *não sei*`}) }
         else if(s.step==='curso_ano'){ 
@@ -278,7 +278,27 @@ Ex: Ensino médio completo, Superior em Administração`}); continue } s.expTemp
             s.cursoTemp.ano=txt;
           }
           d.cursos.push({...s.cursoTemp}); s.cursoTemp={}; s.step='curso_mais'; await sock.sendMessage(jid,{text:`✅ Curso adicionado! Mais cursos? sim ou não`}) }
-        else if(s.step==='curso_mais'){ if(lower.startsWith('s')){ s.step='curso_nome'; await sock.sendMessage(jid,{text:`Próximo curso?`}) } else { await finalizarCurriculo(jid,d,s,sock) } }
+        else if(s.step==='curso_mais'){ if(lower.startsWith('s')){ s.step='curso_nome'; await sock.sendMessage(jid,{text:`Próximo curso?`}) } else { s.step='habilidades'; await sock.sendMessage(jid,{text:`💡 HABILIDADES - Opcional\n\nTem alguma habilidade para destacar?\nEx: Informática avançada, Atendimento ao cliente, Pacote Office, CNH B\n\nDigite suas habilidades ou digite *pular* para não incluir`}) } }
+
+        else if(s.step==='habilidades'){
+          let low = lower.trim()
+          if(['pular','nao','não','n','sem','nenhum','nao tenho','não tenho'].includes(low) || low.includes('pular')){
+            d.habilidades = ''
+          } else {
+            d.habilidades = txt
+          }
+          s.step='resumo'; await sock.sendMessage(jid,{text:`📝 RESUMO PROFISSIONAL - Opcional\n\nQuer adicionar um resumo profissional?\nEx: Profissional dedicado com 5 anos de experiência em vendas, busco oportunidade para crescer...\n\nDigite seu resumo ou digite *pular* para não incluir`})
+        }
+        else if(s.step==='resumo'){
+          let low = lower.trim()
+          if(['pular','nao','não','n','sem','nenhum','nao tenho','não tenho'].includes(low) || low.includes('pular')){
+            d.resumo = ''
+          } else {
+            d.resumo = txt
+          }
+          await finalizarCurriculo(jid,d,s,sock)
+        }
+
       }catch(e){ log(`Erro: ${e.message} - ${e.stack}`) }
     }
   })
@@ -289,6 +309,8 @@ async function finalizarCurriculo(jid,d,s,sock){
 Cargo: ${e.cargo}
 Período: ${e.inicio} até ${e.fim}`).join('\n\n') || 'Primeiro emprego'
   const cursos = d.cursos.map((c,i)=> `${i+1}. ${c.nome} - ${c.instituicao} (${c.ano})`).join('\n') || 'Nenhum'
+  const habilidadesTxt = d.habilidades ? d.habilidades : 'Não informado'
+  const resumoTxt = d.resumo ? d.resumo : 'Não informado'
   const enderecoCompleto = `${d.rua}, ${d.numero}${d.complemento ? ' - '+d.complemento : ''} - ${d.bairro} - ${d.cidade}/${d.estado} - CEP ${d.cep}`
 
   const textoModelo = `🔔 *NOVO CURRÍCULO - Conexão v7cyber*
@@ -309,6 +331,8 @@ Período: ${e.inicio} até ${e.fim}`).join('\n\n') || 'Primeiro emprego'
 *CEP:* ${d.cep}
 *Telefone:* ${d.telefone}
 *Email:* ${d.email}
+*Habilidades:* ${d.habilidades || 'Não informado'}
+*Resumo:* ${d.resumo || 'Não informado'}
 
 *🎯 OBJETIVO*
 ${d.objetivo}
@@ -321,6 +345,12 @@ ${d.formacao}
 
 *📚 CURSOS*
 ${cursos}
+
+*💡 HABILIDADES*
+${habilidadesTxt}
+
+*📝 RESUMO PROFISSIONAL*
+${resumoTxt}
 
 -------------------------
 📱 Candidato: ${jid}
@@ -336,7 +366,7 @@ Meu objetivo é atuar como ${d.objetivo}.
 ${d.experiencias[0] ? `Experiência como ${d.experiencias[0].cargo} na ${d.experiencias[0].empresa.toUpperCase()}.` : 'Em busca do primeiro emprego.'}
 Formação: ${d.formacao}
 Telefone: ${d.telefone} | Email: ${d.email}
-
+${d.habilidades ? `Habilidades: ${d.habilidades}\n` : ''}${d.resumo ? `Resumo: ${d.resumo}\n` : ''}
 Atenciosamente,
 ${d.nome}
 `
@@ -370,7 +400,7 @@ ${d.nome}
 }
 
 startBot()
-app.get('/', (req,res)=> res.send(`<h1>Conexão v7cyber V24 - Estado Civil + Ano Opcional</h1><p>${isConnected?'✅ CONECTADO':'❌ Desconectado'}</p><a href="/whatsapp">QR WhatsApp</a> | <a href="/logs">Logs</a><pre>${logs.slice(-20).join('\n')}</pre>`))
+app.get('/', (req,res)=> res.send(`<h1>Conexão v7cyber V25 - Habilidades e Resumo Opcional</h1><p>${isConnected?'✅ CONECTADO':'❌ Desconectado'}</p><a href="/whatsapp">QR WhatsApp</a> | <a href="/logs">Logs</a><pre>${logs.slice(-20).join('\n')}</pre>`))
 app.get('/whatsapp', async (req,res)=>{
   if(isConnected) return res.send(`<body style="text-align:center;font-family:Arial;padding:40px"><h1 style="color:green">✅ CONECTADO - Conexão v7cyber</h1><p>Bot rodando - (11) 94204-7248</p><p><b>Gatilho:</b> Criar Curriculum</p><p style="background:#25D366;color:white;padding:15px;border-radius:10px">✅ Validação: CEP 00000-000 | Tel (xx) xxxxx-xxxx | Email nome@email.com</p><br><a href="/logs">Logs</a> | <a href="/clear" style="color:red">Desconectar</a><pre style="text-align:left;background:#f0f0f0;padding:10px;margin-top:20px">${logs.slice(-20).join('\n')}</pre></body>`)
   if(!qrCodeData) return res.send(`<h1>Aguardando QR...</h1><pre>${logs.slice(-10).join('\n')}</pre><script>setTimeout(()=>location.reload(),3000)</script>`)
@@ -386,6 +416,7 @@ app.get('/qr', async (req,res)=>{
 app.get('/status', (req,res)=> res.json({connected:isConnected, hasQR:!!qrCodeData, uptime:process.uptime()}))
 app.get('/logs', (req,res)=> res.send(`<pre>${logs.join('\n')}</pre>`))
 app.get('/clear', (req,res)=>{ try{ fs.rmSync('./auth',{recursive:true,force:true}); fs.mkdirSync('./auth',{recursive:true}) }catch(e){}; qrCodeData=null; isConnected=false; res.send('Limpou - novo QR em 5s'); setTimeout(()=>startBot(),1000) })
-app.listen(PORT, ()=> log(`Rodando porta ${PORT} - V24 - Estado Civil + Ano Curso Opcional + Todas validações`))
+app.listen(PORT, ()=> log(`Rodando porta ${PORT} - V25 - Habilidades + Resumo Opcional + Estado Civil + Validacoes`))
+
 
 
