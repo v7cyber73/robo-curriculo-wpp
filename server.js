@@ -61,6 +61,36 @@ function validarDataExp(txt){
   }
   return {ok:false, erro:'Formato inválido. Use MM/AAAA (03/2022) ou DD/MM/AAAA (15/03/2022) ou digite *atual*'}
 }
+
+function validarEstadoCivil(txt){
+  let lower = txt.toLowerCase().trim()
+  const opcoes = {
+    'solteiro':'Solteiro(a)',
+    'solteira':'Solteiro(a)',
+    'casado':'Casado(a)',
+    'casada':'Casado(a)',
+    'divorciado':'Divorciado(a)',
+    'divorciada':'Divorciado(a)',
+    'viuvo':'Viúvo(a)',
+    'viúvo':'Viúvo(a)',
+    'viuva':'Viúvo(a)',
+    'viúva':'Viúvo(a)',
+    'separado':'Separado(a)',
+    'separada':'Separado(a)',
+    'uniao estavel':'União Estável',
+    'união estável':'União Estável',
+    'uniao':'União Estável',
+    'amasiado':'União Estável',
+    'amasiada':'União Estável'
+  }
+  if(opcoes[lower]) return {ok:true, valor:opcoes[lower]}
+  // Tenta contém
+  for(let k in opcoes){
+    if(lower.includes(k)) return {ok:true, valor:opcoes[k]}
+  }
+  return {ok:false}
+}
+
 function validarAno(txt){
   if(!/^\d{4}$/.test(txt)) return {ok:false, erro:'Digite só o ano com 4 números'}
   let a = parseInt(txt)
@@ -152,24 +182,24 @@ Ex: Brasileiro`})
         }
         else if(s.step==='nacionalidade'){ d.nacionalidade=txt; s.step='rua'; await sock.sendMessage(jid,{text:`4️⃣ Nome da RUA / Avenida?
 Ex: Rua das Flores`}) }
-        else if(s.step==='rua'){ d.rua=txt; s.step='numero'; await sock.sendMessage(jid,{text:`5️⃣ NÚMERO da casa?
+        else if(s.step==='rua'){ d.rua=txt; s.step='numero'; await sock.sendMessage(jid,{text:`6️⃣ NÚMERO da casa?
 Ex: 123`}) }
-        else if(s.step==='numero'){ d.numero=txt; s.step='complemento'; await sock.sendMessage(jid,{text:`6️⃣ COMPLEMENTO?
+        else if(s.step==='numero'){ d.numero=txt; s.step='complemento'; await sock.sendMessage(jid,{text:`7️⃣ COMPLEMENTO?
 Ex: Apto 101, Bloco B
 Se não tiver, digite: *não*`}) }
         else if(s.step==='complemento'){ 
           if(lower==='não' || lower==='nao' || lower==='sem' || lower==='n' || lower==='nenhum'){ d.complemento=''; } else { d.complemento=txt; } 
-          s.step='bairro'; await sock.sendMessage(jid,{text:`7️⃣ BAIRRO?
+          s.step='bairro'; await sock.sendMessage(jid,{text:`8️⃣ BAIRRO?
 Ex: Centro`}) 
         }
-        else if(s.step==='bairro'){ d.bairro=txt; s.step='cidade'; await sock.sendMessage(jid,{text:`8️⃣ CIDADE?
+        else if(s.step==='bairro'){ d.bairro=txt; s.step='cidade'; await sock.sendMessage(jid,{text:`9️⃣ CIDADE?
 Ex: São Paulo`}) }
-        else if(s.step==='cidade'){ d.cidade=txt; s.step='estado'; await sock.sendMessage(jid,{text:`9️⃣ ESTADO (sigla 2 letras)?
+        else if(s.step==='cidade'){ d.cidade=txt; s.step='estado'; await sock.sendMessage(jid,{text:`🔟 ESTADO (sigla 2 letras)?
 Ex: SP, RJ, MG`}) }
         else if(s.step==='estado'){ 
           if(txt.length!==2){ await sock.sendMessage(jid,{text:`⚠️ Digite só a sigla com 2 letras
 Ex: SP`}); continue } 
-          d.estado=txt.toUpperCase(); s.step='cep'; await sock.sendMessage(jid,{text:`🔟 CEP?
+          d.estado=txt.toUpperCase(); s.step='cep'; await sock.sendMessage(jid,{text:`1️⃣1️⃣ CEP?
 📮 Formato correto: 00000-000
 Ex: 08500-000
 Pode digitar só números também: 08500000`}) 
@@ -180,7 +210,7 @@ Pode digitar só números também: 08500000`})
 📮 Formato correto: 00000-000
 Ex: 08500-000
 Tente novamente:`}); continue }
-          d.cep=cepFormatado; s.step='telefone'; await sock.sendMessage(jid,{text:`1️⃣1️⃣ TELEFONE / WhatsApp?
+          d.cep=cepFormatado; s.step='telefone'; await sock.sendMessage(jid,{text:`1️⃣2️⃣ TELEFONE / WhatsApp?
 📱 Formato correto: (xx) xxxxx-xxxx
 Ex: (11) 94204-7248
 Pode digitar só números: 11942047248`}) 
@@ -200,7 +230,7 @@ Ex: (11) 94204-7248
 Ex: (11) 3333-4444
 Tente novamente:`}); continue 
           }
-          d.telefone=telFormatado; s.step='email'; await sock.sendMessage(jid,{text:`1️⃣2️⃣ EMAIL?
+          d.telefone=telFormatado; s.step='email'; await sock.sendMessage(jid,{text:`1️⃣3️⃣ EMAIL?
 📧 Formato correto: nome@email.com
 Ex: joao@gmail.com`}) 
         }
@@ -210,16 +240,16 @@ Ex: joao@gmail.com`})
 📧 Formato correto: nome@email.com
 Ex: joao@gmail.com
 Tente novamente:`}); continue }
-          d.email=email; s.step='idade'; await sock.sendMessage(jid,{text:`1️⃣3️⃣ Idade?
+          d.email=email; s.step='idade'; await sock.sendMessage(jid,{text:`1️⃣4️⃣ Idade?
 Ex: 25`}) 
         }
         else if(s.step==='idade'){ 
           if(isNaN(parseInt(txt))){ await sock.sendMessage(jid,{text:`⚠️ Digite só números
 Ex: 25`}); continue }
-          d.idade=txt; s.step='objetivo'; await sock.sendMessage(jid,{text:`1️⃣4️⃣ Objetivo profissional?
+          d.idade=txt; s.step='objetivo'; await sock.sendMessage(jid,{text:`1️⃣5️⃣ Objetivo profissional?
 Ex: Auxiliar administrativo, Vendedor, Motorista`}) 
         }
-        else if(s.step==='objetivo'){ d.objetivo=txt; s.step='exp_empresa'; await sock.sendMessage(jid,{text:`1️⃣5️⃣ Nome da última empresa? Se for seu primeiro emprego digite *primeiro emprego*`}) }
+        else if(s.step==='objetivo'){ d.objetivo=txt; s.step='exp_empresa'; await sock.sendMessage(jid,{text:`1️⃣6️⃣ Nome da última empresa? Se for seu primeiro emprego digite *primeiro emprego*`}) }
         else if(s.step==='exp_empresa'){ if(lower.includes('primeiro')){ d.experiencias=[]; s.step='formacao'; await sock.sendMessage(jid,{text:`Primeiro emprego 💪
 
 Qual sua formação?
@@ -237,11 +267,17 @@ Ex: Ensino médio completo, Superior em Administração`}); continue } s.expTemp
         else if(s.step==='formacao'){ d.formacao=txt; s.step='curso_pergunta'; await sock.sendMessage(jid,{text:`Tem cursos? sim ou não`}) }
         else if(s.step==='curso_pergunta'){ if(lower.startsWith('s')){ s.step='curso_nome'; await sock.sendMessage(jid,{text:`Nome do curso?`}) } else { await finalizarCurriculo(jid,d,s,sock) } }
         else if(s.step==='curso_nome'){ s.cursoTemp.nome=txt; s.step='curso_inst'; await sock.sendMessage(jid,{text:`Onde fez ${txt}?`}) }
-        else if(s.step==='curso_inst'){ s.cursoTemp.instituicao=txt; s.step='curso_ano'; await sock.sendMessage(jid,{text:`Ano? Ex: 2023`}) }
+        else if(s.step==='curso_inst'){ s.cursoTemp.instituicao=txt; s.step='curso_ano'; await sock.sendMessage(jid,{text:`Ano do curso?\nEx: 2023\nSe não lembrar, digite *não lembro* ou *não sei*`}) }
         else if(s.step==='curso_ano'){ 
-          let v = validarAno(txt)
-          if(!v.ok){ await sock.sendMessage(jid,{text:`⚠️ Ano inválido! ${v.erro}\n📅 Digite ano com 4 dígitos - Ex: 2023\nTente novamente:`}); continue }
-          s.cursoTemp.ano=txt; d.cursos.push({...s.cursoTemp}); s.cursoTemp={}; s.step='curso_mais'; await sock.sendMessage(jid,{text:`✅ Curso adicionado! Mais cursos? sim ou não`}) }
+          let lowerAno = txt.toLowerCase()
+          if(['nao lembro','não lembro','nao sei','não sei','nao','não','n','esqueci','nao lembro o ano'].includes(lowerAno) || lowerAno.includes('lembro') || lowerAno.includes('sei')){
+            s.cursoTemp.ano='Não informado';
+          } else {
+            let v = validarAno(txt)
+            if(!v.ok){ await sock.sendMessage(jid,{text:`⚠️ Ano inválido! ${v.erro}\n📅 Digite ano com 4 dígitos - Ex: 2023\nOu digite *não lembro* se não lembrar\nTente novamente:`}); continue }
+            s.cursoTemp.ano=txt;
+          }
+          d.cursos.push({...s.cursoTemp}); s.cursoTemp={}; s.step='curso_mais'; await sock.sendMessage(jid,{text:`✅ Curso adicionado! Mais cursos? sim ou não`}) }
         else if(s.step==='curso_mais'){ if(lower.startsWith('s')){ s.step='curso_nome'; await sock.sendMessage(jid,{text:`Próximo curso?`}) } else { await finalizarCurriculo(jid,d,s,sock) } }
       }catch(e){ log(`Erro: ${e.message} - ${e.stack}`) }
     }
@@ -261,6 +297,7 @@ Período: ${e.inicio} até ${e.fim}`).join('\n\n') || 'Primeiro emprego'
 *Nome:* ${d.nome}
 *Nascimento:* ${d.dataNascimento}
 *Nacionalidade:* ${d.nacionalidade}
+*Estado Civil:* ${d.estadoCivil}
 *Idade:* ${d.idade} anos
 *Endereço:* ${enderecoCompleto}
 *Rua:* ${d.rua}
@@ -333,7 +370,7 @@ ${d.nome}
 }
 
 startBot()
-app.get('/', (req,res)=> res.send(`<h1>Conexão v7cyber V22 - Validação CEP/TEL/EMAIL</h1><p>${isConnected?'✅ CONECTADO':'❌ Desconectado'}</p><a href="/whatsapp">QR WhatsApp</a> | <a href="/logs">Logs</a><pre>${logs.slice(-20).join('\n')}</pre>`))
+app.get('/', (req,res)=> res.send(`<h1>Conexão v7cyber V24 - Estado Civil + Ano Opcional</h1><p>${isConnected?'✅ CONECTADO':'❌ Desconectado'}</p><a href="/whatsapp">QR WhatsApp</a> | <a href="/logs">Logs</a><pre>${logs.slice(-20).join('\n')}</pre>`))
 app.get('/whatsapp', async (req,res)=>{
   if(isConnected) return res.send(`<body style="text-align:center;font-family:Arial;padding:40px"><h1 style="color:green">✅ CONECTADO - Conexão v7cyber</h1><p>Bot rodando - (11) 94204-7248</p><p><b>Gatilho:</b> Criar Curriculum</p><p style="background:#25D366;color:white;padding:15px;border-radius:10px">✅ Validação: CEP 00000-000 | Tel (xx) xxxxx-xxxx | Email nome@email.com</p><br><a href="/logs">Logs</a> | <a href="/clear" style="color:red">Desconectar</a><pre style="text-align:left;background:#f0f0f0;padding:10px;margin-top:20px">${logs.slice(-20).join('\n')}</pre></body>`)
   if(!qrCodeData) return res.send(`<h1>Aguardando QR...</h1><pre>${logs.slice(-10).join('\n')}</pre><script>setTimeout(()=>location.reload(),3000)</script>`)
@@ -349,5 +386,6 @@ app.get('/qr', async (req,res)=>{
 app.get('/status', (req,res)=> res.json({connected:isConnected, hasQR:!!qrCodeData, uptime:process.uptime()}))
 app.get('/logs', (req,res)=> res.send(`<pre>${logs.join('\n')}</pre>`))
 app.get('/clear', (req,res)=>{ try{ fs.rmSync('./auth',{recursive:true,force:true}); fs.mkdirSync('./auth',{recursive:true}) }catch(e){}; qrCodeData=null; isConnected=false; res.send('Limpou - novo QR em 5s'); setTimeout(()=>startBot(),1000) })
-app.listen(PORT, ()=> log(`Rodando porta ${PORT} - V23 CEP/TEL/EMAIL/DATAS com validação total`))
+app.listen(PORT, ()=> log(`Rodando porta ${PORT} - V24 - Estado Civil + Ano Curso Opcional + Todas validações`))
+
 
