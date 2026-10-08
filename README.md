@@ -1,30 +1,38 @@
-# Conexão v7cyber
+# Conexão v7cyber — WhatsApp + Render
 
-Bot/simulador de atendimento em Node.js + Express.
+Esta versão usa o `server.js` real enviado pelo proprietário do projeto.
 
-## Rodar localmente
+## Arquivos
 
-```bash
-npm install
-npm start
-```
-
-Depois abra:
-
-http://localhost:10000
+- `server.js` — bot WhatsApp com Baileys
+- `package.json` — dependências e comando de inicialização
 
 ## Render
 
-- Build Command: `npm install`
-- Start Command: `npm start`
-- Environment: Node
-- A aplicação usa automaticamente a variável `PORT` fornecida pelo Render.
+Tipo: Web Service
 
-## GitHub
+Build Command:
+`npm install`
 
-Envie estes arquivos para um repositório:
-- `server.js`
-- `package.json`
-- `README.md`
+Start Command:
+`npm start`
 
-Depois conecte o repositório ao Render.
+A porta é definida automaticamente pela variável `PORT` do Render.
+
+## Após publicar
+
+Abra:
+`https://SEU-SERVICO.onrender.com/whatsapp`
+
+Escaneie o QR Code com o WhatsApp do número do bot.
+
+Outras páginas:
+- `/` — status
+- `/whatsapp` — QR/conexão
+- `/qr` — QR
+- `/logs` — logs
+- `/status` — status em JSON
+- `/clear` — limpa a autenticação e gera novo QR
+
+IMPORTANTE:
+A pasta `auth` é criada pelo próprio servidor. Em hospedagens com filesystem temporário, uma reinicialização/redeploy pode exigir novo pareamento. Para manter a sessão entre reinicializações, configure armazenamento persistente no serviço de hospedagem.
