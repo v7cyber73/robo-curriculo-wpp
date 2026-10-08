@@ -1,17 +1,8 @@
-const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys')
-const originalError = console.error
-
-console.error = (...args) => {
-  const m = args.join(' ')
-  if (
-    m.includes('Bad MAC') ||
-    m.includes('No matching sessions') ||
-    m.includes('SessionError') ||
-    m.includes('@lid')
-  ) return
-
-  originalError(...args)
-}
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason
+} = require('@whiskeysockets/baileys')
 
 const express = require('express')
 const QRCode = require('qrcode')
@@ -19,147 +10,139 @@ const fs = require('fs')
 const path = require('path')
 
 const app = express()
-const PORT = process.env.PORT || 10000
+app.use(express.json())
 
-let qrCodeData = null
-let isConnected = false
-let logs = []
+const PORT = process.env.PORT || 3000
+
+// ======================================================
+// CONFIGURAÇÕES
+// ======================================================
 
 const sessions = new Map()
 
-function log(m) {
-  const l = `[${new Date().toLocaleTimeString()}] ${m}`
-  console.log(l)
-  logs.push(l)
+const DESTINO_FINAL =
+  process.env.DESTINO_CURRICULOS || '5511942047248@s.whatsapp.net'
 
-  if (logs.length > 200) logs.shift()
+let sock = null
+let qrAtual = null
+let ultimoStatus = 'Desconectado'
+let logs = []
+
+// ======================================================
+// LOG
+// ======================================================
+
+function registrarLog(texto) {
+  const linha = `[${new Date().toLocaleString('pt-BR')}] ${texto}`
+
+  console.log(linha)
+
+  logs.push(linha)
+
+  if (logs.length > 500) {
+    logs.shift()
+  }
 }
 
-try {
-  if (!fs.existsSync('./auth')) {
-    fs.mkdirSync('./auth', { recursive: true })
-  }
-} catch (e) {}
+// ======================================================
+// NORMALIZAR TEXTO
+// ======================================================
 
-function getSession(jid) {
-  if (!sessions.has(jid)) {
-    sessions.set(jid, {
-      step: 'idle',
-      data: {
-        experiencias: [],
-        cursos: []
-      },
-      expTemp: {},
-      cursoTemp: {}
-    })
-  }
-
-  return sessions.get(jid)
+function normalizarTexto(txt) {
+  return String(txt || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
 }
 
+// ======================================================
+// CANCELAMENTO
+// ======================================================
 
-// =====================================================
-// VALIDADORES
-// =====================================================
+function pediuCancelar(txt) {
+  const texto = normalizarTexto(txt)
 
-function validarDataNascimento(txt) {
-
-  if (!/^\d{2}\/\d{2}\/\d{4}$/.test(txt)) {
-    return {
-      ok: false,
-      erro: 'Formato deve ser DD/MM/AAAA'
-    }
-  }
-
-  let [d, m, a] = txt.split('/').map(Number)
-
-  if (m < 1 || m > 12) {
-    return {
-      ok: false,
-      erro: 'Mês inválido (01 a 12)'
-    }
-  }
-
-  if (a < 1920 || a > 2026) {
-    return {
-      ok: false,
-      erro: 'Ano inválido (1920 a 2026)'
-    }
-  }
-
-  let diasNoMes = [
-    31,
-    (a % 4 === 0 && a % 100 !== 0 || a % 400 === 0) ? 29 : 28,
-    31,
-    30,
-    31,
-    30,
-    31,
-    31,
-    30,
-    31,
-    30,
-    31
+  const comandos = [
+    'sair',
+    'cancelar',
+    'parar',
+    'desistir',
+    'exit',
+    'cancel',
+    'stop',
+    'sai',
+    'cancela'
   ]
 
-  if (d < 1 || d > diasNoMes[m - 1]) {
-    return {
-      ok: false,
-      erro: `Dia inválido para mês ${m}. Máximo ${diasNoMes[m - 1]}`
-    }
+  if (comandos.includes(texto)) {
+    return true
   }
 
-  let hoje = new Date()
-  let nasc = new Date(a, m - 1, d)
-
-  if (nasc > hoje) {
-    return {
-      ok: false,
-      erro: 'Data de nascimento não pode ser no futuro'
-    }
+  if (
+    texto.includes('quero sair') ||
+    texto.includes('quero cancelar')
+  ) {
+    return true
   }
 
-  let idade = hoje.getFullYear() - a
-
-  if (idade < 12) {
-    return {
-      ok: false,
-      erro: 'Idade mínima 12 anos'
-    }
-  }
-
-  if (idade > 100) {
-    return {
-      ok: false,
-      erro: 'Verifique o ano, idade muito alta'
-    }
-  }
-
-  return {
-    ok: true
-  }
+  return false
 }
 
+// ======================================================
+// VALIDAÇÕES
+// ======================================================
 
-// =====================================================
-// CÁLCULO AUTOMÁTICO DA IDADE
-// =====================================================
+function validarDataNascimento(data) {
+  const regex = /^(\d{2})\/(\d{2})\/(\d{4})$/
+
+  const match = data.match(regex)
+
+  if (!match) {
+    return false
+  }
+
+  const dia = Number(match[1])
+  const mes = Number(match[2])
+  const ano = Number(match[3])
+
+  const dataObj = new Date(ano, mes - 1, dia)
+
+  if (
+    dataObj.getFullYear() !== ano ||
+    dataObj.getMonth() !== mes - 1 ||
+    dataObj.getDate() !== dia
+  ) {
+    return false
+  }
+
+  const hoje = new Date()
+
+  if (dataObj > hoje) {
+    return false
+  }
+
+  return true
+}
+
+// ======================================================
+// CALCULAR IDADE AUTOMATICAMENTE
+// ======================================================
 
 function calcularIdade(dataNascimento) {
-
-  const [d, m, a] = dataNascimento
+  const [dia, mes, ano] = dataNascimento
     .split('/')
     .map(Number)
 
   const hoje = new Date()
 
-  let idade = hoje.getFullYear() - a
+  let idade = hoje.getFullYear() - ano
 
   const aniversarioAindaNaoChegou =
-    hoje.getMonth() < m - 1 ||
+    hoje.getMonth() < mes - 1 ||
     (
-      hoje.getMonth() === m - 1 &&
-      hoje.getDate() < d
+      hoje.getMonth() === mes - 1 &&
+      hoje.getDate() < dia
     )
 
   if (aniversarioAindaNaoChegou) {
@@ -169,1540 +152,1224 @@ function calcularIdade(dataNascimento) {
   return idade
 }
 
+// ======================================================
 
-// =====================================================
-// VALIDAÇÃO DE EXPERIÊNCIA
-// =====================================================
-
-function validarDataExp(txt) {
-
-  let lower = txt.toLowerCase().trim()
-
-  if (
-    [
-      'atual',
-      'presente',
-      'hoje',
-      'atualmente',
-      'ainda trabalho',
-      'atualidade'
-    ].includes(lower)
-  ) {
-    return {
-      ok: true,
-      valor: 'Atual'
-    }
-  }
-
-  // DD/MM/AAAA
-
-  if (/^\d{2}\/\d{2}\/\d{4}$/.test(txt)) {
-
-    let [d, m, a] = txt.split('/').map(Number)
-
-    if (m < 1 || m > 12) {
-      return {
-        ok: false,
-        erro: 'Mês inválido'
-      }
-    }
-
-    if (a < 1980 || a > 2026) {
-      return {
-        ok: false,
-        erro: 'Ano inválido (1980 a 2026)'
-      }
-    }
-
-    let dias = [
-      31,
-      (a % 4 === 0 && a % 100 !== 0 || a % 400 === 0) ? 29 : 28,
-      31,
-      30,
-      31,
-      30,
-      31,
-      31,
-      30,
-      31,
-      30,
-      31
-    ]
-
-    if (d < 1 || d > dias[m - 1]) {
-      return {
-        ok: false,
-        erro: 'Dia inválido'
-      }
-    }
-
-    return {
-      ok: true,
-      valor: txt
-    }
-  }
-
-  // MM/AAAA
-
-  if (/^\d{2}\/\d{4}$/.test(txt)) {
-
-    let [m, a] = txt.split('/').map(Number)
-
-    if (m < 1 || m > 12) {
-      return {
-        ok: false,
-        erro: 'Mês inválido (01 a 12)'
-      }
-    }
-
-    if (a < 1980 || a > 2026) {
-      return {
-        ok: false,
-        erro: 'Ano inválido'
-      }
-    }
-
-    return {
-      ok: true,
-      valor: txt
-    }
-  }
-
-  return {
-    ok: false,
-    erro: 'Formato inválido. Use MM/AAAA (03/2022) ou DD/MM/AAAA (15/03/2022) ou digite *atual*'
-  }
+function validarEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
 }
 
+// ======================================================
 
-// =====================================================
-// ESTADO CIVIL
-// =====================================================
+function validarCEP(cep) {
+  const somenteNumeros = cep.replace(/\D/g, '')
 
-function validarEstadoCivil(txt) {
+  return somenteNumeros.length === 8
+}
 
-  let lower = txt.toLowerCase().trim()
+// ======================================================
 
-  const opcoes = {
+function formatarCEP(cep) {
+  const numero = cep.replace(/\D/g, '')
 
-    'solteiro': 'Solteiro(a)',
-    'solteira': 'Solteiro(a)',
-
-    'casado': 'Casado(a)',
-    'casada': 'Casado(a)',
-
-    'divorciado': 'Divorciado(a)',
-    'divorciada': 'Divorciado(a)',
-
-    'viuvo': 'Viúvo(a)',
-    'viúvo': 'Viúvo(a)',
-    'viuva': 'Viúvo(a)',
-    'viúva': 'Viúvo(a)',
-
-    'separado': 'Separado(a)',
-    'separada': 'Separado(a)',
-
-    'uniao estavel': 'União Estável',
-    'união estável': 'União Estável',
-    'uniao': 'União Estável',
-
-    'amasiado': 'União Estável',
-    'amasiada': 'União Estável'
+  if (numero.length !== 8) {
+    return cep
   }
 
-  if (opcoes[lower]) {
-    return {
-      ok: true,
-      valor: opcoes[lower]
+  return `${numero.substring(0, 5)}-${numero.substring(5)}`
+}
+
+// ======================================================
+
+function validarTelefone(telefone) {
+  const numero = telefone.replace(/\D/g, '')
+
+  if (numero.length !== 10 && numero.length !== 11) {
+    return false
+  }
+
+  return true
+}
+
+// ======================================================
+
+function formatarTelefone(telefone) {
+  const numero = telefone.replace(/\D/g, '')
+
+  if (numero.length === 11) {
+    return `(${numero.substring(0, 2)}) ${numero.substring(2, 7)}-${numero.substring(7)}`
+  }
+
+  if (numero.length === 10) {
+    return `(${numero.substring(0, 2)}) ${numero.substring(2, 6)}-${numero.substring(6)}`
+  }
+
+  return telefone
+}
+
+// ======================================================
+
+function validarMesAno(valor) {
+  const regex = /^(0[1-9]|1[0-2])\/\d{4}$/
+
+  return regex.test(valor)
+}
+
+// ======================================================
+
+function validarAno(valor) {
+  const ano = Number(valor)
+
+  return (
+    /^\d{4}$/.test(valor) &&
+    ano >= 1900 &&
+    ano <= new Date().getFullYear()
+  )
+}
+
+// ======================================================
+// SESSÃO
+// ======================================================
+
+function criarSessao(jid) {
+  const sessao = {
+    step: 'inicio',
+    dados: {
+      experiencia: [],
+      cursos: [],
+      habilidades: []
     }
   }
 
-  for (let k in opcoes) {
+  sessions.set(jid, sessao)
 
-    if (lower.includes(k)) {
-      return {
-        ok: true,
-        valor: opcoes[k]
-      }
-    }
-  }
-
-  return {
-    ok: false
-  }
+  return sessao
 }
 
+// ======================================================
+// TELA DE APRESENTAÇÃO
+// ======================================================
 
-// =====================================================
-// ANO
-// =====================================================
+async function enviarApresentacao(jid) {
+  await sock.sendMessage(jid, {
+    text:
+`👋 Olá! Seja bem-vindo!
 
-function validarAno(txt) {
+📄 Posso ajudar você a criar um currículo profissional.
 
-  if (!/^\d{4}$/.test(txt)) {
-    return {
-      ok: false,
-      erro: 'Digite só o ano com 4 números'
-    }
-  }
+👉 Digite *1* para criar seu currículo.
 
-  let a = parseInt(txt)
+💬 Se quiser conversar ou pedir outra informação, é só enviar sua mensagem normalmente.
 
-  if (a < 1980 || a > 2026) {
-    return {
-      ok: false,
-      erro: 'Ano inválido (1980 a 2026)'
-    }
-  }
-
-  return {
-    ok: true
-  }
+❌ Durante o preenchimento do currículo, você pode digitar *SAIR* para cancelar.`
+  })
 }
 
+// ======================================================
+// INICIAR CURRÍCULO
+// ======================================================
 
-// =====================================================
-// CEP
-// =====================================================
+async function iniciarCurriculo(jid) {
+  const sessao = criarSessao(jid)
 
-function formatarCEP(txt) {
+  sessao.step = 'dataNascimento'
 
-  let num = txt.replace(/[^0-9]/g, '')
+  await sock.sendMessage(jid, {
+    text:
+`✅ Vamos começar seu currículo!
 
-  if (num.length === 8) {
-    return num.substring(0, 5) + '-' + num.substring(5)
+📅 Primeiro, informe sua *data de nascimento*.
+
+Digite no formato:
+
+*DD/MM/AAAA*
+
+Exemplo:
+*15/03/1998*`
+  })
+}
+
+// ======================================================
+// FINALIZAR CURRÍCULO
+// ======================================================
+
+async function finalizarCurriculo(jid) {
+  const sessao = sessions.get(jid)
+
+  if (!sessao) {
+    return
   }
 
-  return txt
-}
+  const d = sessao.dados
 
-function validarCEP(txt) {
-  return /^\d{5}-\d{3}$/.test(txt)
-}
+  let texto = ''
 
+  texto += `📄 *CURRÍCULO PROFISSIONAL*\n\n`
 
-// =====================================================
-// TELEFONE
-// =====================================================
+  texto += `👤 *DADOS PESSOAIS*\n`
+  texto += `Nome: ${d.nome || 'Não informado'}\n`
+  texto += `Data de nascimento: ${d.dataNascimento || 'Não informado'}\n`
+  texto += `Idade: ${d.idade || 'Não informado'} anos\n`
+  texto += `Estado civil: ${d.estadoCivil || 'Não informado'}\n`
+  texto += `Nacionalidade: ${d.nacionalidade || 'Não informado'}\n\n`
 
-function formatarTelefone(txt) {
+  texto += `🏠 *ENDEREÇO*\n`
+  texto += `${d.endereco || ''}, ${d.numero || ''}\n`
 
-  let num = txt.replace(/[^0-9]/g, '')
-
-  if (num.length === 11) {
-    return `(${num.substring(0, 2)}) ${num.substring(2, 7)}-${num.substring(7)}`
+  if (d.complemento) {
+    texto += `${d.complemento}\n`
   }
 
-  if (num.length === 10) {
-    return `(${num.substring(0, 2)}) ${num.substring(2, 6)}-${num.substring(6)}`
+  texto += `${d.bairro || ''} - ${d.cidade || ''}/${d.estado || ''}\n`
+  texto += `CEP: ${d.cep || 'Não informado'}\n\n`
+
+  texto += `📞 *CONTATO*\n`
+  texto += `Telefone: ${d.telefone || 'Não informado'}\n`
+  texto += `E-mail: ${d.email || 'Não informado'}\n\n`
+
+  // ====================================================
+  // EXPERIÊNCIA
+  // ====================================================
+
+  texto += `💼 *EXPERIÊNCIA PROFISSIONAL*\n`
+
+  if (d.experiencia && d.experiencia.length > 0) {
+    d.experiencia.forEach((exp, index) => {
+      texto += `\n${index + 1}. ${exp.cargo || ''}\n`
+      texto += `Empresa: ${exp.empresa || ''}\n`
+      texto += `Cargo: ${exp.funcao || ''}\n`
+      texto += `Período: ${exp.inicio || ''} até ${exp.fim || ''}\n`
+    })
+  } else {
+    texto += `Não informado.\n`
   }
 
-  return null
-}
+  texto += `\n`
 
-function validarTelefoneFormatado(txt) {
-  return /^\(\d{2}\) \d{4,5}-\d{4}$/.test(txt)
-}
+  // ====================================================
+  // FORMAÇÃO
+  // ====================================================
 
+  texto += `🎓 *FORMAÇÃO ACADÊMICA*\n`
+  texto += `${d.formacao || 'Não informado'}\n\n`
 
-// =====================================================
-// EMAIL
-// =====================================================
+  // ====================================================
+  // CURSOS
+  // ====================================================
 
-function validarEmail(txt) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(txt)
-}
+  texto += `📚 *CURSOS E QUALIFICAÇÕES*\n`
 
-
-// =====================================================
-// BOT WHATSAPP
-// =====================================================
-
-async function startBot() {
-
-  const {
-    state,
-    saveCreds
-  } = await useMultiFileAuthState('./auth')
-
-  let version
-
-  try {
-
-    version = (
-      await fetchLatestBaileysVersion()
-    ).version
-
-  } catch (e) {
-
-    version = [2, 3000, 1023223821]
+  if (d.cursos && d.cursos.length > 0) {
+    d.cursos.forEach((curso, index) => {
+      texto += `\n${index + 1}. ${curso.nome || ''}\n`
+      texto += `Instituição: ${curso.instituicao || ''}\n`
+      texto += `Ano: ${curso.ano || ''}\n`
+    })
+  } else {
+    texto += `Não informado.\n`
   }
 
-  const sock = makeWASocket({
+  texto += `\n`
 
-    version,
+  // ====================================================
+  // HABILIDADES
+  // ====================================================
 
-    auth: state,
+  texto += `🛠️ *HABILIDADES*\n`
 
-    browser: [
-      'Conexão v7cyber',
-      'Chrome',
-      '122'
-    ],
+  if (d.habilidades && d.habilidades.length > 0) {
+    texto += d.habilidades.join(', ')
+  } else {
+    texto += `Não informado.`
+  }
 
-    markOnlineOnConnect: false
+  texto += `\n\n`
+
+  // ====================================================
+  // OBJETIVO
+  // ====================================================
+
+  texto += `🎯 *OBJETIVO PROFISSIONAL*\n`
+  texto += `${d.objetivo || 'Não informado'}\n`
+
+  // ====================================================
+  // ENVIAR PARA DESTINO
+  // ====================================================
+
+  await sock.sendMessage(DESTINO_FINAL, {
+    text: texto
   })
 
-  sock.ev.on(
-    'creds.update',
-    saveCreds
-  )
+  await sock.sendMessage(jid, {
+    text:
+`✅ *Currículo finalizado com sucesso!*
 
-  sock.ev.on(
-    'connection.update',
-    (u) => {
+📄 Seus dados foram organizados e enviados para análise.
 
-      if (u.qr) {
+Obrigado por utilizar nosso atendimento! 😊`
+  })
 
-        qrCodeData = u.qr
+  sessions.delete(jid)
 
-        isConnected = false
+  registrarLog(`Currículo finalizado: ${jid}`)
+}
 
-        log(
-          'QR gerado - escaneie em /whatsapp'
+// ======================================================
+// PROCESSAR MENSAGEM
+// ======================================================
+
+async function processarMensagem(jid, txt) {
+
+  const texto = String(txt || '').trim()
+
+  if (!texto) {
+    return
+  }
+
+  const textoNormalizado = normalizarTexto(texto)
+
+  registrarLog(`Mensagem de ${jid}: ${texto}`)
+
+  // ====================================================
+  // SE NÃO EXISTE CADASTRO
+  // ====================================================
+
+  if (!sessions.has(jid)) {
+
+    // Primeira interação:
+    // mostra a apresentação e NÃO inicia o currículo.
+
+    if (
+      textoNormalizado !== '1'
+    ) {
+      await enviarApresentacao(jid)
+
+      // Aqui o cliente pode continuar conversando
+      // normalmente sem iniciar o currículo.
+
+      return
+    }
+
+    // Se digitou 1, começa o currículo.
+
+    await iniciarCurriculo(jid)
+
+    return
+  }
+
+  // ====================================================
+  // EXISTE UMA SESSÃO
+  // ====================================================
+
+  const sessao = sessions.get(jid)
+
+  // ====================================================
+  // CANCELAR
+  // ====================================================
+
+  if (pediuCancelar(texto)) {
+
+    sessions.delete(jid)
+
+    await sock.sendMessage(jid, {
+      text:
+`❌ Cadastro cancelado.
+
+Quando quiser criar um currículo novamente, digite *1*.`
+    })
+
+    return
+  }
+
+  const d = sessao.dados
+
+  // ====================================================
+  // DATA DE NASCIMENTO
+  // ====================================================
+
+  if (sessao.step === 'dataNascimento') {
+
+    if (!validarDataNascimento(texto)) {
+
+      await sock.sendMessage(jid, {
+        text:
+`❌ Data inválida.
+
+Digite sua data de nascimento no formato:
+
+*DD/MM/AAAA*
+
+Exemplo:
+*15/03/1998*`
+      })
+
+      return
+    }
+
+    d.dataNascimento = texto
+    d.idade = calcularIdade(texto)
+
+    await sock.sendMessage(jid, {
+      text:
+`✅ Data registrada: ${d.dataNascimento}
+
+🎂 Sua idade foi calculada automaticamente:
+*${d.idade} anos*
+
+👤 Agora informe seu *nome completo*.`
+    })
+
+    sessao.step = 'nome'
+
+    return
+  }
+
+  // ====================================================
+  // NOME
+  // ====================================================
+
+  if (sessao.step === 'nome') {
+
+    if (texto.length < 3) {
+
+      await sock.sendMessage(jid, {
+        text:
+`❌ Informe seu nome completo.`
+      })
+
+      return
+    }
+
+    d.nome = texto
+
+    await sock.sendMessage(jid, {
+      text:
+`🌎 Qual é a sua *nacionalidade*?
+
+Exemplo:
+Brasileiro`
+    })
+
+    sessao.step = 'nacionalidade'
+
+    return
+  }
+
+  // ====================================================
+  // NACIONALIDADE
+  // ====================================================
+
+  if (sessao.step === 'nacionalidade') {
+
+    d.nacionalidade = texto
+
+    await sock.sendMessage(jid, {
+      text:
+`🏠 Informe o nome da sua *rua/avenida*.`
+    })
+
+    sessao.step = 'endereco'
+
+    return
+  }
+
+  // ====================================================
+  // ENDEREÇO
+  // ====================================================
+
+  if (sessao.step === 'endereco') {
+
+    d.endereco = texto
+
+    await sock.sendMessage(jid, {
+      text:
+`🔢 Informe o *número* do endereço.`
+    })
+
+    sessao.step = 'numero'
+
+    return
+  }
+
+  // ====================================================
+  // NÚMERO
+  // ====================================================
+
+  if (sessao.step === 'numero') {
+
+    d.numero = texto
+
+    await sock.sendMessage(jid, {
+      text:
+`🏠 Possui *complemento*?
+
+Se não possuir, digite:
+
+*não*`
+    })
+
+    sessao.step = 'complemento'
+
+    return
+  }
+
+  // ====================================================
+  // COMPLEMENTO
+  // ====================================================
+
+  if (sessao.step === 'complemento') {
+
+    if (textoNormalizado !== 'nao') {
+      d.complemento = texto
+    } else {
+      d.complemento = ''
+    }
+
+    await sock.sendMessage(jid, {
+      text:
+`📍 Informe o seu *bairro*.`
+    })
+
+    sessao.step = 'bairro'
+
+    return
+  }
+
+  // ====================================================
+  // BAIRRO
+  // ====================================================
+
+  if (sessao.step === 'bairro') {
+
+    d.bairro = texto
+
+    await sock.sendMessage(jid, {
+      text:
+`🏙️ Informe sua *cidade*.`
+    })
+
+    sessao.step = 'cidade'
+
+    return
+  }
+
+  // ====================================================
+  // CIDADE
+  // ====================================================
+
+  if (sessao.step === 'cidade') {
+
+    d.cidade = texto
+
+    await sock.sendMessage(jid, {
+      text:
+`🗺️ Informe o seu *estado*.
+
+Exemplo:
+SP`
+    })
+
+    sessao.step = 'estado'
+
+    return
+  }
+
+  // ====================================================
+  // ESTADO
+  // ====================================================
+
+  if (sessao.step === 'estado') {
+
+    d.estado = texto.toUpperCase()
+
+    await sock.sendMessage(jid, {
+      text:
+`📮 Informe seu *CEP*.
+
+Exemplo:
+09300-000`
+    })
+
+    sessao.step = 'cep'
+
+    return
+  }
+
+  // ====================================================
+  // CEP
+  // ====================================================
+
+  if (sessao.step === 'cep') {
+
+    if (!validarCEP(texto)) {
+
+      await sock.sendMessage(jid, {
+        text:
+`❌ CEP inválido.
+
+Digite um CEP com 8 números.
+
+Exemplo:
+09300-000`
+      })
+
+      return
+    }
+
+    d.cep = formatarCEP(texto)
+
+    await sock.sendMessage(jid, {
+      text:
+`📞 Informe seu *telefone* com DDD.
+
+Exemplo:
+11942047248`
+    })
+
+    sessao.step = 'telefone'
+
+    return
+  }
+
+  // ====================================================
+  // TELEFONE
+  // ====================================================
+
+  if (sessao.step === 'telefone') {
+
+    if (!validarTelefone(texto)) {
+
+      await sock.sendMessage(jid, {
+        text:
+`❌ Telefone inválido.
+
+Informe seu telefone com DDD.
+
+Exemplo:
+11942047248`
+      })
+
+      return
+    }
+
+    d.telefone = formatarTelefone(texto)
+
+    await sock.sendMessage(jid, {
+      text:
+`📧 Informe seu *e-mail*.
+
+Exemplo:
+nome@gmail.com`
+    })
+
+    sessao.step = 'email'
+
+    return
+  }
+
+  // ====================================================
+  // EMAIL
+  // ====================================================
+
+  if (sessao.step === 'email') {
+
+    if (!validarEmail(texto)) {
+
+      await sock.sendMessage(jid, {
+        text:
+`❌ E-mail inválido.
+
+Digite um e-mail válido.
+
+Exemplo:
+nome@gmail.com`
+      })
+
+      return
+    }
+
+    d.email = texto
+
+    await sock.sendMessage(jid, {
+      text:
+`💼 Agora vamos cadastrar sua *experiência profissional*.
+
+Qual foi o seu último cargo?`
+    })
+
+    sessao.step = 'experienciaCargo'
+
+    return
+  }
+
+  // ====================================================
+  // EXPERIÊNCIA - CARGO
+  // ====================================================
+
+  if (sessao.step === 'experienciaCargo') {
+
+    sessao.experienciaAtual = {
+      cargo: texto
+    }
+
+    await sock.sendMessage(jid, {
+      text:
+`🏢 Qual era o nome da *empresa*?`
+    })
+
+    sessao.step = 'experienciaEmpresa'
+
+    return
+  }
+
+  // ====================================================
+  // EXPERIÊNCIA - EMPRESA
+  // ====================================================
+
+  if (sessao.step === 'experienciaEmpresa') {
+
+    sessao.experienciaAtual.empresa = texto
+
+    await sock.sendMessage(jid, {
+      text:
+`💼 Qual era sua *função/cargo* nessa empresa?`
+    })
+
+    sessao.step = 'experienciaFuncao'
+
+    return
+  }
+
+  // ====================================================
+  // EXPERIÊNCIA - FUNÇÃO
+  // ====================================================
+
+  if (sessao.step === 'experienciaFuncao') {
+
+    sessao.experienciaAtual.funcao = texto
+
+    await sock.sendMessage(jid, {
+      text:
+`📅 Informe o mês e ano em que começou.
+
+Exemplo:
+03/2022`
+    })
+
+    sessao.step = 'experienciaInicio'
+
+    return
+  }
+
+  // ====================================================
+  // EXPERIÊNCIA - INÍCIO
+  // ====================================================
+
+  if (sessao.step === 'experienciaInicio') {
+
+    if (!validarMesAno(texto)) {
+
+      await sock.sendMessage(jid, {
+        text:
+`❌ Formato inválido.
+
+Digite no formato:
+
+MM/AAAA
+
+Exemplo:
+03/2022`
+      })
+
+      return
+    }
+
+    sessao.experienciaAtual.inicio = texto
+
+    await sock.sendMessage(jid, {
+      text:
+`📅 Você ainda trabalha nessa empresa?
+
+Digite:
+
+*sim*
+
+ou
+
+*não*`
+    })
+
+    sessao.step = 'experienciaAtual'
+
+    return
+  }
+
+  // ====================================================
+  // EXPERIÊNCIA - ATUAL
+  // ====================================================
+
+  if (sessao.step === 'experienciaAtual') {
+
+    if (textoNormalizado === 'sim') {
+
+      sessao.experienciaAtual.fim = 'Atual'
+
+    } else {
+
+      await sock.sendMessage(jid, {
+        text:
+`📅 Informe o mês e ano em que saiu.
+
+Exemplo:
+08/2025`
+      })
+
+      sessao.step = 'experienciaFim'
+
+      return
+    }
+
+    d.experiencia.push(sessao.experienciaAtual)
+
+    await sock.sendMessage(jid, {
+      text:
+`✅ Experiência adicionada!
+
+Deseja adicionar outra experiência?
+
+Digite:
+
+*sim*
+
+ou
+
+*não*`
+    })
+
+    sessao.step = 'maisExperiencia'
+
+    return
+  }
+
+  // ====================================================
+  // EXPERIÊNCIA - FIM
+  // ====================================================
+
+  if (sessao.step === 'experienciaFim') {
+
+    if (!validarMesAno(texto)) {
+
+      await sock.sendMessage(jid, {
+        text:
+`❌ Formato inválido.
+
+Use:
+
+MM/AAAA
+
+Exemplo:
+08/2025`
+      })
+
+      return
+    }
+
+    sessao.experienciaAtual.fim = texto
+
+    d.experiencia.push(sessao.experienciaAtual)
+
+    await sock.sendMessage(jid, {
+      text:
+`✅ Experiência adicionada!
+
+Deseja adicionar outra experiência?
+
+Digite:
+
+*sim*
+
+ou
+
+*não*`
+    })
+
+    sessao.step = 'maisExperiencia'
+
+    return
+  }
+
+  // ====================================================
+  // MAIS EXPERIÊNCIA
+  // ====================================================
+
+  if (sessao.step === 'maisExperiencia') {
+
+    if (textoNormalizado === 'sim') {
+
+      await sock.sendMessage(jid, {
+        text:
+`💼 Informe o *cargo* da próxima experiência.`
+      })
+
+      sessao.step = 'experienciaCargo'
+
+      return
+    }
+
+    await sock.sendMessage(jid, {
+      text:
+`🎓 Agora informe sua *formação acadêmica*.
+
+Exemplo:
+Ensino médio completo`
+    })
+
+    sessao.step = 'formacao'
+
+    return
+  }
+
+  // ====================================================
+  // FORMAÇÃO
+  // ====================================================
+
+  if (sessao.step === 'formacao') {
+
+    d.formacao = texto
+
+    await sock.sendMessage(jid, {
+      text:
+`📚 Você possui algum *curso profissionalizante ou curso complementar*?
+
+Digite:
+
+*sim*
+
+ou
+
+*não*`
+    })
+
+    sessao.step = 'possuiCurso'
+
+    return
+  }
+
+  // ====================================================
+  // POSSUI CURSO
+  // ====================================================
+
+  if (sessao.step === 'possuiCurso') {
+
+    if (textoNormalizado === 'sim') {
+
+      await sock.sendMessage(jid, {
+        text:
+`📚 Qual é o nome do curso?`
+      })
+
+      sessao.step = 'cursoNome'
+
+      return
+    }
+
+    await sock.sendMessage(jid, {
+      text:
+`🛠️ Informe suas principais *habilidades*.
+
+Exemplo:
+Pacote Office, atendimento ao cliente, vendas`
+    })
+
+    sessao.step = 'habilidades'
+
+    return
+  }
+
+  // ====================================================
+  // CURSO - NOME
+  // ====================================================
+
+  if (sessao.step === 'cursoNome') {
+
+    sessao.cursoAtual = {
+      nome: texto
+    }
+
+    await sock.sendMessage(jid, {
+      text:
+`🏫 Qual foi a *instituição* onde realizou o curso?`
+    })
+
+    sessao.step = 'cursoInstituicao'
+
+    return
+  }
+
+  // ====================================================
+  // CURSO - INSTITUIÇÃO
+  // ====================================================
+
+  if (sessao.step === 'cursoInstituicao') {
+
+    sessao.cursoAtual.instituicao = texto
+
+    await sock.sendMessage(jid, {
+      text:
+`📅 Em qual *ano* concluiu o curso?
+
+Exemplo:
+2023`
+    })
+
+    sessao.step = 'cursoAno'
+
+    return
+  }
+
+  // ====================================================
+  // CURSO - ANO
+  // ====================================================
+
+  if (sessao.step === 'cursoAno') {
+
+    if (!validarAno(texto)) {
+
+      await sock.sendMessage(jid, {
+        text:
+`❌ Ano inválido.
+
+Digite o ano com 4 números.
+
+Exemplo:
+2023`
+      })
+
+      return
+    }
+
+    sessao.cursoAtual.ano = texto
+
+    d.cursos.push(sessao.cursoAtual)
+
+    await sock.sendMessage(jid, {
+      text:
+`✅ Curso adicionado!
+
+Deseja adicionar outro curso?
+
+Digite:
+
+*sim*
+
+ou
+
+*não*`
+    })
+
+    sessao.step = 'maisCurso'
+
+    return
+  }
+
+  // ====================================================
+  // MAIS CURSO
+  // ====================================================
+
+  if (sessao.step === 'maisCurso') {
+
+    if (textoNormalizado === 'sim') {
+
+      await sock.sendMessage(jid, {
+        text:
+`📚 Qual é o nome do próximo curso?`
+      })
+
+      sessao.step = 'cursoNome'
+
+      return
+    }
+
+    await sock.sendMessage(jid, {
+      text:
+`🛠️ Informe suas principais *habilidades*.
+
+Exemplo:
+Pacote Office, atendimento ao cliente, vendas`
+    })
+
+    sessao.step = 'habilidades'
+
+    return
+  }
+
+  // ====================================================
+  // HABILIDADES
+  // ====================================================
+
+  if (sessao.step === 'habilidades') {
+
+    d.habilidades = texto
+      .split(',')
+      .map(item => item.trim())
+      .filter(Boolean)
+
+    await sock.sendMessage(jid, {
+      text:
+`🎯 Por último, informe seu *objetivo profissional*.
+
+Exemplo:
+"Busco uma oportunidade na área administrativa, onde possa aplicar meus conhecimentos e contribuir com a empresa."`
+    })
+
+    sessao.step = 'objetivo'
+
+    return
+  }
+
+  // ====================================================
+  // OBJETIVO
+  // ====================================================
+
+  if (sessao.step === 'objetivo') {
+
+    d.objetivo = texto
+
+    await sock.sendMessage(jid, {
+      text:
+`⏳ Finalizando seu currículo...`
+    })
+
+    await finalizarCurriculo(jid)
+
+    return
+  }
+}
+
+// ======================================================
+// CONEXÃO WHATSAPP
+// ======================================================
+
+async function conectarWhatsApp() {
+
+  const { state, saveCreds } =
+    await useMultiFileAuthState(
+      path.join(__dirname, 'auth')
+    )
+
+  sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: false
+  })
+
+  sock.ev.on('creds.update', saveCreds)
+
+  sock.ev.on('connection.update', async (update) => {
+
+    const {
+      connection,
+      lastDisconnect,
+      qr
+    } = update
+
+    if (qr) {
+
+      qrAtual = qr
+      ultimoStatus = 'Aguardando leitura do QR Code'
+
+      registrarLog('Novo QR Code gerado')
+
+      try {
+
+        const qrImagem =
+          await QRCode.toDataURL(qr)
+
+        qrAtual = qrImagem
+
+      } catch (erro) {
+
+        registrarLog(
+          `Erro ao gerar QR Code: ${erro.message}`
         )
       }
+    }
 
-      if (u.connection === 'close') {
+    if (connection === 'open') {
 
-        isConnected = false
+      ultimoStatus = 'Conectado'
+      qrAtual = null
 
-        log(
-          'Desconectado - reconectando em 5s'
+      registrarLog(
+        'WhatsApp conectado com sucesso'
+      )
+    }
+
+    if (connection === 'close') {
+
+      ultimoStatus = 'Desconectado'
+
+      const codigo =
+        lastDisconnect?.error?.output?.statusCode
+
+      registrarLog(
+        `WhatsApp desconectado. Código: ${codigo || 'desconhecido'}`
+      )
+
+      if (
+        codigo !== DisconnectReason.loggedOut
+      ) {
+
+        registrarLog(
+          'Tentando reconectar...'
         )
 
         setTimeout(
-          startBot,
-          5000
-        )
-      }
-
-      if (u.connection === 'open') {
-
-        isConnected = true
-
-        qrCodeData = null
-
-        const meuId =
-          sock.user.id
-            .split(':')[0]
-            .split('@')[0]
-
-        log(
-          `✅ CONECTADO como ${meuId} - Pronto para receber curriculos`
+          conectarWhatsApp,
+          3000
         )
       }
     }
-  )
-
-
-  // ===================================================
-  // RECEBIMENTO DAS MENSAGENS
-  // ===================================================
+  })
 
   sock.ev.on(
     'messages.upsert',
-    async (up) => {
+    async ({ messages }) => {
 
-      for (const m of up.messages) {
-
-        if (!m.message) continue
-
-        const jid =
-          m.key.remoteJid
-
-        if (
-          !jid ||
-          jid.includes('@g.us') ||
-          m.key.fromMe
-        ) {
-          continue
-        }
-
-        const txt =
-          (
-            m.message.conversation ||
-            m.message.extendedTextMessage?.text ||
-            ''
-          ).trim()
-
-        if (!txt) continue
-
-        const lower =
-          txt.toLowerCase()
-
-        log(
-          `📩 Mensagem de ${jid}: ${txt.substring(0, 60)}`
-        )
-
-
-        // =================================================
-        // SAIR / CANCELAR
-        // =================================================
-
-        const comandosSair = [
-
-          'sair',
-          'cancelar',
-          'parar',
-          'desistir',
-          'exit',
-          'cancel',
-          'stop',
-          'sai',
-          'cancela'
-
-        ]
-
-        if (
-          comandosSair.includes(lower) ||
-          lower.includes('quero sair') ||
-          lower.includes('quero cancelar')
-        ) {
-
-          const sess =
-            sessions.get(jid)
-
-          if (
-            sess &&
-            sess.step !== 'idle'
-          ) {
-
-            sessions.delete(jid)
-
-            log(
-              `🚪 ${jid} cancelou o preenchimento`
-            )
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `❌ Cadastro cancelado com sucesso!
-
-Se quiser recomeçar, digite *1*.
-
-🤖 Conexão v7cyber`
-              }
-            )
-
-          } else {
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `👋 Você não está em nenhum cadastro no momento.
-
-Digite *1* para criar um novo currículo.
-
-🤖 Conexão v7cyber`
-              }
-            )
-          }
-
-          continue
-        }
-
-
-        // =================================================
-        // MENU
-        // =================================================
-
-        if (
-          !sessions.has(jid) &&
-          txt === '1'
-        ) {
-
-          sessions.set(
-            jid,
-            {
-              step: 'nome',
-
-              data: {
-                experiencias: [],
-                cursos: []
-              },
-
-              expTemp: {},
-              cursoTemp: {}
-            }
-          )
-
-          await sock.sendMessage(
-            jid,
-            {
-              text: `👋 Olá! Sou o Robô da Conexão v7cyber 🤖
-
-Vamos montar seu currículo profissional!
-
-💡 Dica: A qualquer momento digite *sair* ou *cancelar* para cancelar.
-
-1️⃣ Qual seu nome e sobrenome completo?`
-            }
-          )
-
-          continue
-        }
-
-
-        // =================================================
-        // OUTRAS MENSAGENS
-        // =================================================
-
-        const s =
-          getSession(jid)
-
-        if (
-          s.step === 'idle'
-        ) {
-          continue
-        }
-
-        const d =
-          s.data
-
+      for (const msg of messages) {
 
         try {
 
-
-          // ===============================================
-          // NOME
-          // ===============================================
-
-          if (
-            s.step === 'nome'
-          ) {
-
-            if (
-              txt.split(' ').length < 2
-            ) {
-
-              await sock.sendMessage(
-                jid,
-                {
-                  text: `⚠️ Digite nome e sobrenome completo
-
-Ex: João Silva`
-                }
-              )
-
-              continue
-            }
-
-            d.nome = txt
-
-            s.step = 'nascimento'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `2️⃣ Data de nascimento?
-
-📅 Formato: DD/MM/AAAA
-
-Ex: 15/03/1998`
-              }
-            )
+          if (!msg.message) {
+            continue
           }
 
-
-          // ===============================================
-          // NASCIMENTO
-          // ===============================================
-
-          else if (
-            s.step === 'nascimento'
-          ) {
-
-            const validacao =
-              validarDataNascimento(txt)
-
-            if (!validacao.ok) {
-
-              await sock.sendMessage(
-                jid,
-                {
-                  text: `⚠️ ${validacao.erro}
-
-📅 Use o formato DD/MM/AAAA
-
-Ex: 15/03/1998`
-                }
-              )
-
-              continue
-            }
-
-            d.dataNascimento = txt
-
-            // IDADE AUTOMÁTICA
-            d.idade =
-              calcularIdade(txt)
-
-            s.step = 'nacionalidade'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `3️⃣ Nacionalidade?
-
-Ex: Brasileiro`
-              }
-            )
+          if (msg.key.fromMe) {
+            continue
           }
 
+          const jid = msg.key.remoteJid
 
-          // ===============================================
-          // NACIONALIDADE
-          // ===============================================
-
-          else if (
-            s.step === 'nacionalidade'
-          ) {
-
-            d.nacionalidade =
-              txt
-
-            s.step = 'rua'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `4️⃣ Nome da RUA / Avenida?
-
-Ex: Rua das Flores`
-              }
-            )
+          if (!jid || jid.endsWith('@g.us')) {
+            continue
           }
 
+          const mensagem =
+            msg.message.conversation ||
+            msg.message.extendedTextMessage?.text ||
+            ''
 
-          // ===============================================
-          // RUA
-          // ===============================================
-
-          else if (
-            s.step === 'rua'
-          ) {
-
-            d.rua = txt
-
-            s.step = 'numero'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `6️⃣ NÚMERO da casa?
-
-Ex: 123`
-              }
-            )
+          if (!mensagem) {
+            continue
           }
 
-
-          // ===============================================
-          // NÚMERO
-          // ===============================================
-
-          else if (
-            s.step === 'numero'
-          ) {
-
-            d.numero = txt
-
-            s.step = 'complemento'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `7️⃣ COMPLEMENTO?
-
-Ex: Apto 101, Bloco B
-
-Se não tiver, digite: *não*`
-              }
-            )
-          }
-
-
-          // ===============================================
-          // COMPLEMENTO
-          // ===============================================
-
-          else if (
-            s.step === 'complemento'
-          ) {
-
-            if (
-              lower === 'não' ||
-              lower === 'nao' ||
-              lower === 'sem' ||
-              lower === 'n' ||
-              lower === 'nenhum'
-            ) {
-
-              d.complemento = ''
-
-            } else {
-
-              d.complemento = txt
-            }
-
-            s.step = 'bairro'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `8️⃣ BAIRRO?
-
-Ex: Centro`
-              }
-            )
-          }
-
-
-          // ===============================================
-          // BAIRRO
-          // ===============================================
-
-          else if (
-            s.step === 'bairro'
-          ) {
-
-            d.bairro = txt
-
-            s.step = 'cidade'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `9️⃣ CIDADE?
-
-Ex: São Paulo`
-              }
-            )
-          }
-
-
-          // ===============================================
-          // CIDADE
-          // ===============================================
-
-          else if (
-            s.step === 'cidade'
-          ) {
-
-            d.cidade = txt
-
-            s.step = 'estado'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `🔟 ESTADO (sigla 2 letras)?
-
-Ex: SP, RJ, MG`
-              }
-            )
-          }
-
-
-          // ===============================================
-          // ESTADO
-          // ===============================================
-
-          else if (
-            s.step === 'estado'
-          ) {
-
-            if (
-              txt.length !== 2
-            ) {
-
-              await sock.sendMessage(
-                jid,
-                {
-                  text: `⚠️ Digite só a sigla com 2 letras
-
-Ex: SP`
-                }
-              )
-
-              continue
-            }
-
-            d.estado =
-              txt.toUpperCase()
-
-            s.step = 'cep'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `1️⃣1️⃣ CEP?
-
-📮 Formato correto: 00000-000
-
-Ex: 08500-000
-
-Pode digitar só números também:
-08500000`
-              }
-            )
-          }
-
-
-          // ===============================================
-          // CEP
-          // ===============================================
-
-          else if (
-            s.step === 'cep'
-          ) {
-
-            let cepFormatado =
-              formatarCEP(txt)
-
-            if (
-              !validarCEP(cepFormatado)
-            ) {
-
-              await sock.sendMessage(
-                jid,
-                {
-                  text: `⚠️ CEP inválido!
-
-📮 Formato correto:
-00000-000
-
-Ex: 08500-000
-
-Tente novamente:`
-                }
-              )
-
-              continue
-            }
-
-            d.cep =
-              cepFormatado
-
-            s.step =
-              'telefone'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `1️⃣2️⃣ TELEFONE / WhatsApp?
-
-📱 Formato correto:
-(xx) xxxxx-xxxx
-
-Ex: (11) 94204-7248
-
-Pode digitar só números:
-11942047248`
-              }
-            )
-          }
-
-
-          // ===============================================
-          // TELEFONE
-          // ===============================================
-
-          else if (
-            s.step === 'telefone'
-          ) {
-
-            let telFormatado =
-              txt
-
-            let soNumeros =
-              txt.replace(
-                /[^0-9]/g,
-                ''
-              )
-
-            if (
-              soNumeros.length >= 10
-            ) {
-
-              let fmt =
-                formatarTelefone(txt)
-
-              if (fmt) {
-                telFormatado = fmt
-              }
-            }
-
-            if (
-              !validarTelefoneFormatado(
-                telFormatado
-              )
-            ) {
-
-              await sock.sendMessage(
-                jid,
-                {
-                  text: `⚠️ Telefone inválido!
-
-📱 Formato correto:
-(xx) xxxxx-xxxx
-
-Ex: (11) 94204-7248
-
-Ex: (11) 3333-4444
-
-Tente novamente:`
-                }
-              )
-
-              continue
-            }
-
-            d.telefone =
-              telFormatado
-
-            s.step =
-              'email'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `1️⃣3️⃣ EMAIL?
-
-📧 Formato correto:
-nome@email.com
-
-Ex: joao@gmail.com`
-              }
-            )
-          }
-
-
-          // ===============================================
-          // EMAIL
-          // ===============================================
-
-          else if (
-            s.step === 'email'
-          ) {
-
-            let email =
-              txt.toLowerCase().trim()
-
-            if (
-              !validarEmail(email)
-            ) {
-
-              await sock.sendMessage(
-                jid,
-                {
-                  text: `⚠️ Email inválido!
-
-📧 Formato correto:
-nome@email.com
-
-Ex: joao@gmail.com
-
-Tente novamente:`
-                }
-              )
-
-              continue
-            }
-
-            d.email =
-              email
-
-            s.step =
-              'objetivo'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `1️⃣4️⃣ Objetivo profissional?
-
-Ex: Auxiliar administrativo, Vendedor, Motorista`
-              }
-            )
-          }
-
-
-          // ===============================================
-          // OBJETIVO
-          // ===============================================
-
-          else if (
-            s.step === 'objetivo'
-          ) {
-
-            d.objetivo =
-              txt
-
-            s.step =
-              'exp_empresa'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `1️⃣5️⃣ Nome da última empresa?
-
-Se for seu primeiro emprego digite *primeiro emprego*`
-              }
-            )
-          }
-
-
-          // ===============================================
-          // EMPRESA
-          // ===============================================
-
-          else if (
-            s.step === 'exp_empresa'
-          ) {
-
-            if (
-              lower.includes('primeiro')
-            ) {
-
-              d.experiencias = []
-
-              s.step =
-                'formacao'
-
-              await sock.sendMessage(
-                jid,
-                {
-                  text: `Primeiro emprego 💪
-
-Qual sua formação?
-
-Ex: Ensino médio completo, Superior em Administração`
-                }
-              )
-
-              continue
-            }
-
-            s.expTemp.empresa =
-              txt
-
-            s.step =
-              'exp_cargo'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `Cargo na ${txt}?`
-              }
-            )
-          }
-
-
-          // ===============================================
-          // CARGO
-          // ===============================================
-
-          else if (
-            s.step === 'exp_cargo'
-          ) {
-
-            s.expTemp.cargo =
-              txt
-
-            s.step =
-              'exp_inicio'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `Data INÍCIO?
-
-Ex: 03/2022 ou 15/03/2022`
-              }
-            )
-          }
-
-
-          // ===============================================
-          // INÍCIO
-          // ===============================================
-
-          else if (
-            s.step === 'exp_inicio'
-          ) {
-
-            let v =
-              validarDataExp(txt)
-
-            if (!v.ok) {
-
-              await sock.sendMessage(
-                jid,
-                {
-                  text: `⚠️ Data inválida!
-
-${v.erro}
-
-📅 Formatos válidos:
-
-• MM/AAAA - Ex: 03/2022
-• DD/MM/AAAA - Ex: 15/03/2022
-
-Tente novamente:`
-                }
-              )
-
-              continue
-            }
-
-            s.expTemp.inicio =
-              v.valor
-
-            s.step =
-              'exp_fim'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `Data SAÍDA?
-
-📅 Ex: 12/2023 ou 15/12/2023
-
-Ou digite *atual* se ainda trabalha lá`
-              }
-            )
-          }
-
-
-          // ===============================================
-          // SAÍDA
-          // ===============================================
-
-          else if (
-            s.step === 'exp_fim'
-          ) {
-
-            let v =
-              validarDataExp(txt)
-
-            if (!v.ok) {
-
-              await sock.sendMessage(
-                jid,
-                {
-                  text: `⚠️ Data inválida!
-
-${v.erro}
-
-📅 Formatos válidos:
-
-• MM/AAAA - Ex: 12/2023
-• DD/MM/AAAA - Ex: 15/12/2023
-• Digite *atual*
-
-Tente novamente:`
-                }
-              )
-
-              continue
-            }
-
-            s.expTemp.fim =
-              v.valor
-
-            d.experiencias.push(
-              {
-                ...s.expTemp
-              }
-            )
-
-            s.expTemp = {}
-
-            s.step =
-              'exp_mais'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `✅ ${d.experiencias[d.experiencias.length - 1].empresa} adicionado!
-
-Tem mais empresas? sim ou não`
-              }
-            )
-          }
-
-
-          // ===============================================
-          // MAIS EMPRESAS
-          // ===============================================
-
-          else if (
-            s.step === 'exp_mais'
-          ) {
-
-            if (
-              lower.startsWith('s')
-            ) {
-
-              s.step =
-                'exp_empresa'
-
-              await sock.sendMessage(
-                jid,
-                {
-                  text: `Próxima empresa?`
-                }
-              )
-
-            } else {
-
-              s.step =
-                'formacao'
-
-              await sock.sendMessage(
-                jid,
-                {
-                  text: `Qual sua formação?`
-                }
-              )
-            }
-          }
-
-
-          // ===============================================
-          // FORMAÇÃO
-          // ===============================================
-
-          else if (
-            s.step === 'formacao'
-          ) {
-
-            d.formacao =
-              txt
-
-            s.step =
-              'curso_pergunta'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `Tem cursos? sim ou não`
-              }
-            )
-          }
-
-
-          // ===============================================
-          // CURSOS
-          // ===============================================
-
-          else if (
-            s.step === 'curso_pergunta'
-          ) {
-
-            if (
-              lower.startsWith('s')
-            ) {
-
-              s.step =
-                'curso_nome'
-
-              await sock.sendMessage(
-                jid,
-                {
-                  text: `Nome do curso?`
-                }
-              )
-
-            } else {
-
-              s.step =
-                'habilidades'
-
-              await sock.sendMessage(
-                jid,
-                {
-                  text: `💡 HABILIDADES - Opcional
-
-Tem alguma habilidade para destacar?
-
-Ex: Informática avançada, Atendimento ao cliente, Pacote Office, CNH B
-
-Digite suas habilidades ou digite *pular* para não incluir`
-                }
-              )
-            }
-          }
-
-
-          else if (
-            s.step === 'curso_nome'
-          ) {
-
-            s.cursoTemp.nome =
-              txt
-
-            s.step =
-              'curso_inst'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `Onde fez ${txt}?`
-              }
-            )
-          }
-
-
-          else if (
-            s.step === 'curso_inst'
-          ) {
-
-            s.cursoTemp.instituicao =
-              txt
-
-            s.step =
-              'curso_ano'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `Ano do curso?
-
-Ex: 2023
-
-Se não lembrar, digite *não lembro* ou *não sei*`
-              }
-            )
-          }
-
-
-          else if (
-            s.step === 'curso_ano'
-          ) {
-
-            let lowerAno =
-              txt.toLowerCase()
-
-            if (
-              [
-                'nao lembro',
-                'não lembro',
-                'nao sei',
-                'não sei',
-                'nao',
-                'não',
-                'n',
-                'esqueci',
-                'nao lembro o ano'
-              ].includes(lowerAno) ||
-              lowerAno.includes('lembro') ||
-              lowerAno.includes('sei')
-            ) {
-
-              s.cursoTemp.ano =
-                'Não informado'
-
-            } else {
-
-              let v =
-                validarAno(txt)
-
-              if (!v.ok) {
-
-                await sock.sendMessage(
-                  jid,
-                  {
-                    text: `⚠️ Ano inválido!
-
-${v.erro}
-
-📅 Digite ano com 4 dígitos.
-
-Ex: 2023
-
-Ou digite *não lembro* se não lembrar.
-
-Tente novamente:`
-                  }
-                )
-
-                continue
-              }
-
-              s.cursoTemp.ano =
-                txt
-            }
-
-            d.cursos.push(
-              {
-                ...s.cursoTemp
-              }
-            )
-
-            s.cursoTemp = {}
-
-            s.step =
-              'curso_mais'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `✅ Curso adicionado!
-
-Mais cursos? sim ou não`
-              }
-            )
-          }
-
-
-          else if (
-            s.step === 'curso_mais'
-          ) {
-
-            if (
-              lower.startsWith('s')
-            ) {
-
-              s.step =
-                'curso_nome'
-
-              await sock.sendMessage(
-                jid,
-                {
-                  text: `Próximo curso?`
-                }
-              )
-
-            } else {
-
-              s.step =
-                'habilidades'
-
-              await sock.sendMessage(
-                jid,
-                {
-                  text: `💡 HABILIDADES - Opcional
-
-Tem alguma habilidade para destacar?
-
-Ex: Informática avançada, Atendimento ao cliente, Pacote Office, CNH B
-
-Digite suas habilidades ou digite *pular* para não incluir`
-                }
-              )
-            }
-          }
-
-
-          // ===============================================
-          // HABILIDADES
-          // ===============================================
-
-          else if (
-            s.step === 'habilidades'
-          ) {
-
-            let low =
-              lower.trim()
-
-            if (
-              [
-                'pular',
-                'nao',
-                'não',
-                'n',
-                'sem',
-                'nenhum',
-                'nao tenho',
-                'não tenho'
-              ].includes(low) ||
-              low.includes('pular')
-            ) {
-
-              d.habilidades = ''
-
-            } else {
-
-              d.habilidades =
-                txt
-            }
-
-            s.step =
-              'resumo'
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `📝 RESUMO PROFISSIONAL - Opcional
-
-Quer adicionar um resumo profissional?
-
-Ex: Profissional dedicado com 5 anos de experiência em vendas, busco oportunidade para crescer...
-
-Digite seu resumo ou digite *pular* para não incluir`
-              }
-            )
-          }
-
-
-          // ===============================================
-          // RESUMO
-          // ===============================================
-
-          else if (
-            s.step === 'resumo'
-          ) {
-
-            let low =
-              lower.trim()
-
-            if (
-              [
-                'pular',
-                'nao',
-                'não',
-                'n',
-                'sem',
-                'nenhum',
-                'nao tenho',
-                'não tenho'
-              ].includes(low) ||
-              low.includes('pular')
-            ) {
-
-              d.resumo = ''
-
-            } else {
-
-              d.resumo =
-                txt
-            }
-
-            await finalizarCurriculo(
-              jid,
-              d,
-              s,
-              sock
-            )
-          }
-
-
-        } catch (e) {
-
-          log(
-            `Erro: ${e.message} - ${e.stack}`
+          await processarMensagem(
+            jid,
+            mensagem
+          )
+
+        } catch (erro) {
+
+          registrarLog(
+            `Erro ao processar mensagem: ${erro.message}`
           )
         }
       }
@@ -1710,531 +1377,179 @@ Digite seu resumo ou digite *pular* para não incluir`
   )
 }
 
+// ======================================================
+// ROTAS HTTP
+// ======================================================
 
-// =====================================================
-// FINALIZAÇÃO DO CURRÍCULO
-// =====================================================
+app.get('/', (req, res) => {
 
-async function finalizarCurriculo(
-  jid,
-  d,
-  s,
-  sock
-) {
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="pt-BR">
 
-  const exps =
-    d.experiencias
-      .map(
-        (e, i) =>
-          `${i + 1}. ${e.empresa.toUpperCase()}
-Cargo: ${e.cargo}
-Período: ${e.inicio} até ${e.fim}`
-      )
-      .join('\n\n') ||
-    'Primeiro emprego'
+    <head>
 
+      <meta charset="UTF-8">
 
-  const cursos =
-    d.cursos
-      .map(
-        (c, i) =>
-          `${i + 1}. ${c.nome} - ${c.instituicao} (${c.ano})`
-      )
-      .join('\n') ||
-    'Nenhum'
+      <title>Bot Currículo</title>
 
+      <style>
 
-  const habilidadesTxt =
-    d.habilidades
-      ? d.habilidades
-      : 'Não informado'
+        body {
+          font-family: Arial, sans-serif;
+          background: #f5f5f5;
+          padding: 40px;
+        }
 
+        .container {
+          max-width: 700px;
+          margin: auto;
+          background: white;
+          padding: 30px;
+          border-radius: 15px;
+          box-shadow: 0 5px 20px rgba(0,0,0,0.1);
+        }
 
-  const resumoTxt =
-    d.resumo
-      ? d.resumo
-      : 'Não informado'
+        h1 {
+          color: #222;
+        }
 
+        .status {
+          padding: 15px;
+          background: #eee;
+          border-radius: 10px;
+          margin-top: 20px;
+        }
 
-  const enderecoCompleto =
-    `${d.rua}, ${d.numero}` +
-    `${d.complemento ? ' - ' + d.complemento : ''}` +
-    ` - ${d.bairro}` +
-    ` - ${d.cidade}/${d.estado}` +
-    ` - CEP ${d.cep}`
+      </style>
 
+    </head>
 
-  const textoModelo =
-`🔔 *NOVO CURRÍCULO - Conexão v7cyber*
+    <body>
 
-*👤 DADOS PESSOAIS*
-*Nome:* ${d.nome}
-*Nascimento:* ${d.dataNascimento}
-*Nacionalidade:* ${d.nacionalidade}
-*Estado Civil:* ${d.estadoCivil || 'Não informado'}
-*Idade:* ${d.idade} anos
-*Endereço:* ${enderecoCompleto}
-*Rua:* ${d.rua}
-*Número:* ${d.numero}
-*Complemento:* ${d.complemento || 'Não informado'}
-*Bairro:* ${d.bairro}
-*Cidade:* ${d.cidade}
-*Estado:* ${d.estado}
-*CEP:* ${d.cep}
-*Telefone:* ${d.telefone}
-*Email:* ${d.email}
-*Habilidades:* ${d.habilidades || 'Não informado'}
-*Resumo:* ${d.resumo || 'Não informado'}
+      <div class="container">
 
-*🎯 OBJETIVO*
-${d.objetivo}
+        <h1>📄 Gerador de Currículos</h1>
 
-*💼 EXPERIÊNCIAS*
-${exps}
+        <p>
+          Bot de atendimento via WhatsApp.
+        </p>
 
-*🎓 FORMAÇÃO*
-${d.formacao}
+        <div class="status">
 
-*📚 CURSOS*
-${cursos}
+          <strong>Status:</strong>
+          ${ultimoStatus}
 
-*💡 HABILIDADES*
-${habilidadesTxt}
+        </div>
 
-*📝 RESUMO PROFISSIONAL*
-${resumoTxt}
+        <p>
+          📱 No WhatsApp, o cliente verá a apresentação
+          e poderá digitar <strong>1</strong> para criar
+          o currículo.
+        </p>
 
--------------------------
-📱 Candidato: ${jid}
-🤖 Conexão v7cyber
+      </div>
 
-*✉️ CARTA DE APRESENTAÇÃO*
+    </body>
 
-Prezados,
+    </html>
+  `)
+})
 
-Meu nome é ${d.nome}, nascido em ${d.dataNascimento}, ${d.nacionalidade}, ${d.idade} anos, email ${d.email}.
-Moro em ${enderecoCompleto}.
-Meu objetivo é atuar como ${d.objetivo}.
-${d.experiencias[0]
-  ? `Experiência como ${d.experiencias[0].cargo} na ${d.experiencias[0].empresa.toUpperCase()}.`
-  : 'Em busca do primeiro emprego.'}
-Formação: ${d.formacao}
-Telefone: ${d.telefone} | Email: ${d.email}
-${d.habilidades ? `Habilidades: ${d.habilidades}\n` : ''}
-${d.resumo ? `Resumo: ${d.resumo}\n` : ''}
-Atenciosamente,
-${d.nome}
-`
+// ======================================================
 
+app.get('/whatsapp', (req, res) => {
 
-  const nomeArquivo =
-    `CURRICULO-${d.nome.replace(/ /g, '_')}.txt`
+  res.json({
+    status: ultimoStatus,
+    conectado: ultimoStatus === 'Conectado',
+    mensagem:
+      'Digite 1 no WhatsApp para criar um currículo.'
+  })
+})
 
-  const caminhoArquivo =
-    path.join(
-      __dirname,
-      nomeArquivo
-    )
+// ======================================================
 
+app.get('/qr', (req, res) => {
 
-  try {
+  if (!qrAtual) {
 
-    fs.writeFileSync(
-      caminhoArquivo,
-      textoModelo
-    )
-
-  } catch (e) {
-
-    log(
-      `Erro criar arquivo: ${e.message}`
-    )
+    return res.send(`
+      <h2>QR Code não disponível</h2>
+      <p>Status: ${ultimoStatus}</p>
+    `)
   }
 
+  res.send(`
+    <html>
 
-  try {
+      <body
+        style="
+          text-align:center;
+          font-family:Arial;
+        "
+      >
 
-    const destinoFinal =
-      '5511942047248@s.whatsapp.net'
+        <h2>📱 Escaneie o QR Code</h2>
 
-    log(
-      `📤 Enviando curriculo ${d.nome} para ${destinoFinal}`
-    )
+        <img
+          src="${qrAtual}"
+          style="max-width:400px;"
+        >
 
+        <p>${ultimoStatus}</p>
 
-    await sock.sendMessage(
-      destinoFinal,
-      {
-        text: textoModelo
-      }
-    )
+      </body>
 
+    </html>
+  `)
+})
 
-    await new Promise(
-      r => setTimeout(r, 800)
-    )
+// ======================================================
 
+app.get('/status', (req, res) => {
 
-    await sock.sendMessage(
-      destinoFinal,
-      {
-        document:
-          fs.readFileSync(
-            caminhoArquivo
-          ),
+  res.json({
+    status: ultimoStatus,
+    sessoes: sessions.size,
+    destino: DESTINO_FINAL
+  })
+})
 
-        mimetype:
-          'text/plain',
+// ======================================================
 
-        fileName:
-          `CURRICULO-${d.nome.toUpperCase()}.txt`
-      }
-    )
+app.get('/logs', (req, res) => {
 
+  res.type('text').send(
+    logs.join('\n')
+  )
+})
 
-    log(
-      `✅ Enviado!`
-    )
+// ======================================================
 
+app.get('/clear', (req, res) => {
 
-    try {
+  sessions.clear()
 
-      fs.unlinkSync(
-        caminhoArquivo
-      )
+  res.json({
+    sucesso: true,
+    mensagem: 'Sessões limpas.'
+  })
+})
 
-    } catch (e) {}
+// ======================================================
+// INICIAR SERVIDOR
+// ======================================================
 
-  } catch (e) {
+app.listen(PORT, () => {
 
-    log(
-      `❌ Erro envio: ${e.message}`
-    )
-  }
-
-
-  await sock.sendMessage(
-    jid,
-    {
-      text: `✅ Obrigado, ${d.nome}! Seu currículo foi recebido com sucesso!
-
-📧 Email: ${d.email}
-📱 Tel: ${d.telefone}
-
-🚀 Conexão v7cyber agradece seu cadastro!
-
-📄 Em breve enviaremos seu currículo por PDF`
-    }
+  console.log(
+    `Servidor iniciado na porta ${PORT}`
   )
 
-
-  sessions.delete(jid)
-}
-
-
-// =====================================================
-// INICIAR BOT
-// =====================================================
-
-startBot()
-
-
-// =====================================================
-// PÁGINA PRINCIPAL
-// =====================================================
-
-app.get(
-  '/',
-  (req, res) =>
-    res.send(
-      `<h1>Conexão v7cyber - Currículo</h1>
-<p>${isConnected ? '✅ CONECTADO' : '❌ Desconectado'}</p>
-<a href="/whatsapp">QR WhatsApp</a> |
-<a href="/logs">Logs</a>
-<pre>${logs.slice(-20).join('\n')}</pre>`
-    )
-)
-
-
-// =====================================================
-// QR WHATSAPP
-// =====================================================
-
-app.get(
-  '/whatsapp',
-  async (req, res) => {
-
-    if (isConnected) {
-
-      return res.send(
-        `<body style="text-align:center;font-family:Arial;padding:40px">
-
-<h1 style="color:green">
-✅ CONECTADO - Conexão v7cyber
-</h1>
-
-<p>
-Bot rodando - (11) 94204-7248
-</p>
-
-<p>
-<b>Menu:</b> digite 1 para criar currículo
-</p>
-
-<p style="
-background:#25D366;
-color:white;
-padding:15px;
-border-radius:10px
-">
-
-✅ Validação:
-CEP 00000-000 |
-Tel (xx) xxxxx-xxxx |
-Email nome@email.com
-
-</p>
-
-<br>
-
-<a href="/logs">
-Logs
-</a>
-
-|
-
-<a href="/clear" style="color:red">
-Desconectar
-</a>
-
-<pre style="
-text-align:left;
-background:#f0f0f0;
-padding:10px;
-margin-top:20px
-">
-${logs.slice(-20).join('\n')}
-</pre>
-
-</body>`
-      )
-    }
-
-
-    if (!qrCodeData) {
-
-      return res.send(
-        `<h1>Aguardando QR...</h1>
-
-<pre>
-${logs.slice(-10).join('\n')}
-</pre>
-
-<script>
-setTimeout(
-  () => location.reload(),
-  3000
-)
-</script>`
-      )
-    }
-
-
-    const img =
-      await QRCode.toDataURL(
-        qrCodeData
-      )
-
-
-    res.send(
-      `<body style="
-text-align:center;
-font-family:Arial
-">
-
-<h1>
-📱 Escaneie o QR
-</h1>
-
-<p>
-Conexão v7cyber
-</p>
-
-<img
-src="${img}"
-style="
-width:380px;
-border:10px solid #25D366;
-border-radius:20px
-"
->
-
-<br>
-
-<p>
-Depois mande <b>1</b>
-de outro celular.
-</p>
-
-<script>
-setTimeout(
-  () => location.reload(),
-  15000
-)
-</script>
-
-</body>`
-    )
-  }
-)
-
-
-// =====================================================
-// QR SIMPLES
-// =====================================================
-
-app.get(
-  '/qr',
-  async (req, res) => {
-
-    if (isConnected) {
-      return res.send(
-        '<h1 style="color:green">✅ CONECTADO</h1>'
-      )
-    }
-
-
-    if (!qrCodeData) {
-
-      return res.send(
-        `<h1>Sem QR</h1>
-
-<pre>
-${logs.slice(-10).join('\n')}
-</pre>
-
-<script>
-setTimeout(
-  () => location.reload(),
-  4000
-)
-</script>`
-      )
-    }
-
-
-    const img =
-      await QRCode.toDataURL(
-        qrCodeData
-      )
-
-
-    res.send(
-      `<body style="text-align:center">
-
-<h1>
-Escaneie
-</h1>
-
-<img
-src="${img}"
-style="width:350px"
->
-
-<script>
-setTimeout(
-  () => location.reload(),
-  20000
-)
-</script>
-
-</body>`
-    )
-  }
-)
-
-
-// =====================================================
-// STATUS
-// =====================================================
-
-app.get(
-  '/status',
-  (req, res) =>
-    res.json({
-      connected: isConnected,
-      hasQR: !!qrCodeData,
-      uptime: process.uptime()
-    })
-)
-
-
-// =====================================================
-// LOGS
-// =====================================================
-
-app.get(
-  '/logs',
-  (req, res) =>
-    res.send(
-      `<pre>${logs.join('\n')}</pre>`
-    )
-)
-
-
-// =====================================================
-// LIMPAR SESSÃO / QR
-// =====================================================
-
-app.get(
-  '/clear',
-  (req, res) => {
-
-    try {
-
-      fs.rmSync(
-        './auth',
-        {
-          recursive: true,
-          force: true
-        }
-      )
-
-      fs.mkdirSync(
-        './auth',
-        {
-          recursive: true
-        }
-      )
-
-    } catch (e) {}
-
-
-    qrCodeData = null
-
-    isConnected = false
-
-    res.send(
-      'Limpou - novo QR em 5s'
-    )
-
-
-    setTimeout(
-      () => startBot(),
-      1000
-    )
-  }
-)
-
-
-// =====================================================
-// SERVIDOR
-// =====================================================
-
-app.listen(
-  PORT,
-  () =>
-    log(
-      `Rodando porta ${PORT} - Conexão v7cyber`
-    )
-)
+  registrarLog(
+    `Servidor HTTP iniciado na porta ${PORT}`
+  )
+
+  conectarWhatsApp()
+})
