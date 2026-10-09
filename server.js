@@ -549,7 +549,7 @@ function finalizarContrato(s) {
   adminMessages.push({data:new Date().toLocaleString('pt-BR'), candidato:'Contrato de locação', texto});
   const nome = d.locatario_nome || 'cliente';
   sessions.delete(s.jid);
-  return [`✅ Obrigado! Os dados do contrato foram recebidos e enviados para análise do administrador.\n\nConfira as informações com atenção antes da assinatura.`, '__CONTRATO_ENVIADO__'];
+  return [`✅ Obrigado! Os dados do contrato foram recebidos e enviados para análise do administrador.\n\nConfira as informações com atenção antes da assinatura.\n\nDigite *menu* para voltar às opções ou *fim* para encerrar o atendimento.`, '__CONTRATO_ENVIADO__'];
 }
 
 
@@ -672,6 +672,48 @@ function respostaSimNao(txt) {
   return null;
 }
 
+// Guarda as etapas do currículo para permitir voltar à pergunta anterior.
+function definirEtapa(s, proxima) {
+  if (s.step !== proxima) {
+    if (!Array.isArray(s.stepHistory)) s.stepHistory = [];
+    s.stepHistory.push(s.step);
+  }
+  s.step = proxima;
+}
+
+function perguntaCurriculo(etapa, s) {
+  const prompts = {
+    nome: '1️⃣ Qual seu nome e sobrenome completo?',
+    nascimento: '2️⃣ Data de nascimento?\n\n📅 Formato: DD/MM/AAAA\nEx: 15/03/1998',
+    nacionalidade: '3️⃣ Nacionalidade?\nEx: Brasileiro',
+    estadoCivil: '4️⃣ Estado civil?\n\nEx: Solteiro, Casado, Divorciado ou União Estável',
+    rua: '5️⃣ Nome da RUA / Avenida?\nEx: Rua das Flores',
+    numero: '6️⃣ NÚMERO da casa?\nEx: 123',
+    complemento: '7️⃣ COMPLEMENTO?\n\nEx: Apto 101, Bloco B\nSe não tiver, digite *não*',
+    bairro: '8️⃣ BAIRRO?\nEx: Centro',
+    cidade: '9️⃣ CIDADE?\nEx: São Paulo',
+    estado: '🔟 ESTADO (sigla 2 letras)?\nEx: SP, RJ, MG',
+    cep: '1️⃣1️⃣ CEP?\n\nFormato: 00000-000\nEx: 08500-000\n\nPode digitar só números: 08500000',
+    telefone: '1️⃣2️⃣ TELEFONE / WhatsApp?\n\nEx: (11) 94204-7248\nPode digitar só números: 11942047248',
+    email: '1️⃣3️⃣ EMAIL?\n\nEx: joao@gmail.com',
+    objetivo: '1️⃣4️⃣ Objetivo profissional?\n\nEx: Auxiliar administrativo, Vendedor, Motorista',
+    exp_empresa: '1️⃣5️⃣ Nome da última empresa?\n\nSe for seu primeiro emprego digite *primeiro emprego*',
+    exp_cargo: `Cargo na ${s.expTemp?.empresa || 'empresa'}?`,
+    exp_inicio: 'Data INÍCIO?\nEx: 03/2022 ou 15/03/2022',
+    exp_fim: 'Data SAÍDA?\nEx: 12/2023\n\nOu digite *atual* se ainda trabalha lá.',
+    exp_mais: '✅ Empresa adicionada!\n\nTem mais empresas?\n\n1️⃣ Sim\n2️⃣ Não\n3️⃣ Pular\n\nVocê também pode digitar sim ou não.',
+    formacao: 'Qual sua formação?\nEx: Ensino médio completo, Superior em Administração',
+    curso_pergunta: 'Tem cursos?\n\n1️⃣ Sim\n2️⃣ Não\n3️⃣ Pular\n\nVocê também pode digitar sim ou não.',
+    curso_nome: 'Nome do curso?',
+    curso_inst: `Onde fez ${s.cursoTemp?.nome || 'o curso'}?`,
+    curso_ano: 'Ano do curso?\nEx: 2023\n\nSe não lembrar, digite *não lembro*.',
+    curso_mais: '✅ Curso adicionado!\n\nMais cursos?\n\n1️⃣ Sim\n2️⃣ Não\n3️⃣ Pular\n\nVocê também pode digitar sim ou não.',
+    habilidades: '💡 HABILIDADES - Opcional\n\nDigite suas habilidades ou *pular*.',
+    resumo: '📝 RESUMO PROFISSIONAL - Opcional\n\nDigite seu resumo ou *pular*.'
+  };
+  return prompts[etapa] || 'Continue o preenchimento respondendo à próxima pergunta.';
+}
+
 // ======================================================
 // MOTOR DO BOT
 // ======================================================
@@ -683,9 +725,9 @@ async function processarMensagem(jid, txt) {
   const agora = Date.now();
   const LIMITE_INATIVIDADE = 4 * 60 * 60 * 1000; // 4 horas
 
-  // Se o cliente estava fora do currículo e ficou 1 hora sem interagir,
+  // Se o cliente estiver fora de um cadastro e ficar 4 horas sem interagir,
   // a próxima mensagem inicia um novo atendimento mostrando o menu.
-  // O preenchimento de currículo nunca é reiniciado por inatividade.
+  // Cadastros ativos não são reiniciados automaticamente por inatividade.
   if (
     s.step === 'idle' &&
     s.lastActivityAt &&
@@ -699,20 +741,28 @@ async function processarMensagem(jid, txt) {
   // ======================================================
   // MENU INICIAL
   // Qualquer primeira mensagem mostra o menu.
-  // Os números 1/2/3/4 só são opções logo após o menu ser exibido.
+  // Os números só são opções logo após o menu ser exibido; no meio do cadastro,
+  // o menu funciona como uma sobreposição sem apagar a etapa atual.
   // Fora desse momento, todos os números seguem como conversa normal.
   // ======================================================
 
   if (s.step === 'idle') {
     // Comandos para abrir o menu novamente a qualquer momento.
     if (lower === 'menu' || lower === 'voltar' || lower === 'inicio' || lower === 'início') {
+      if (s.menuPendente) return [];
       s.menuExibido = true;
       s.menuPendente = true;
       return [menuPrincipal()];
     }
 
-    // TODOS os números do menu (1, 2, 3 e 4) só funcionam se o menu
-    // acabou de ser exibido e ainda aguarda uma escolha. Fora disso,
+    if (['fim','encerrar','obrigado','obrigada'].includes(lower)) {
+      s.menuPendente = false;
+      s.menuExibido = true;
+      return ['Obrigado por entrar em contato com a *Conexão v7cyber*! 😊\nQuando precisar, é só mandar uma mensagem.'];
+    }
+
+    // TODOS os números do menu só funcionam se o menu acabou de ser exibido
+    // e ainda aguarda uma escolha. Fora disso,
     // números como 1, 2, 3 ou 4 não acionam nenhuma opção.
     if (s.menuPendente && ['1', '2', '3'].includes(lower)) {
       s.menuPendente = false;
@@ -740,7 +790,8 @@ async function processarMensagem(jid, txt) {
         lastActivityAt:Date.now(),
         data:{ experiencias:[], cursos:[] },
         expTemp:{},
-        cursoTemp:{}
+        cursoTemp:{},
+        stepHistory:[]
       });
 
       return [`👋 Olá! Sou o Robô da Conexão v7cyber 🤖
@@ -774,7 +825,8 @@ Vamos montar seu currículo profissional!
         lastActivityAt:Date.now(),
         data:{ experiencias:[], cursos:[] },
         expTemp:{},
-        cursoTemp:{}
+        cursoTemp:{},
+        stepHistory:[]
       });
 
       return [`👋 Olá! Sou o Robô da Conexão v7cyber 🤖
@@ -797,6 +849,46 @@ Vamos montar seu currículo profissional!
     // Assim, números enviados durante uma conversa não acionam opções por engano.
     s.menuPendente = false;
     return [];
+  }
+
+  // Comandos globais durante um cadastro ativo.
+  if (s.step !== 'idle' && ['menu','inicio','início'].includes(lower)) {
+    if (s.menuPendente) return [];
+    s.menuPendente = true;
+    return [menuPrincipal()];
+  }
+
+  if (s.step !== 'idle' && lower === 'voltar') {
+    s.menuPendente = false;
+    if (s.step === 'contrato') {
+      if (s.data.contractIndex <= 0) return ['Você já está na primeira pergunta do contrato.'];
+      s.data.contractIndex--;
+      return [`↩️ Voltamos uma pergunta.\n\n${perguntaContrato(s)}`];
+    }
+    const anterior = Array.isArray(s.stepHistory) ? s.stepHistory.pop() : null;
+    if (!anterior) return ['Você já está na primeira pergunta do currículo.'];
+    s.step = anterior;
+    return [`↩️ Voltamos uma pergunta.\n\n${perguntaCurriculo(s.step, s)}`];
+  }
+
+  // Se o menu foi aberto no meio do cadastro, processa a escolha sem perder
+  // a etapa atual. Opções 4 e 5 iniciam o serviço selecionado.
+  if (s.step !== 'idle' && s.menuPendente && ['1','2','3','4','5','6'].includes(lower)) {
+    s.menuPendente = false;
+    if (lower === '4') return iniciarContrato(jid);
+    if (lower === '5') {
+      sessions.set(jid, {
+        step:'nome', menuExibido:true, menuPendente:false, lastActivityAt:Date.now(),
+        data:{ experiencias:[], cursos:[] }, expTemp:{}, cursoTemp:{}, stepHistory:[]
+      });
+      return ['👋 Vamos montar seu currículo profissional!\n\nDigite *sair* ou *cancelar* para cancelar.\n\n' + perguntaCurriculo('nome', {expTemp:{},cursoTemp:{}})];
+    }
+    const info = respostaMenu(lower);
+    return [info ? `${info}\n\nPara continuar seu cadastro, responda à pergunta anterior. Digite *menu* para ver as opções novamente.` : menuPrincipal()];
+  }
+  if (s.step !== 'idle' && s.menuPendente) {
+    // Uma resposta que não é opção fecha o menu e continua o cadastro normalmente.
+    s.menuPendente = false;
   }
 
   const sair = [
@@ -828,7 +920,8 @@ Vamos montar seu currículo profissional!
       step:'nome',
       data:{ experiencias:[], cursos:[] },
       expTemp:{},
-      cursoTemp:{}
+      cursoTemp:{},
+      stepHistory:[]
     });
 
     return [`👋 Olá! Sou o Robô da Conexão v7cyber 🤖
@@ -848,7 +941,7 @@ Vamos montar seu currículo profissional!
       return ['⚠️ Digite nome e sobrenome completo.\nEx: João Silva'];
 
     d.nome = txt;
-    s.step = 'nascimento';
+    definirEtapa(s, 'nascimento');
     return ['2️⃣ Data de nascimento?\n\n📅 Formato: DD/MM/AAAA\nEx: 15/03/1998'];
   }
 
@@ -858,13 +951,13 @@ Vamos montar seu currículo profissional!
 
     d.dataNascimento = txt;
     d.idade = v.idade;
-    s.step = 'nacionalidade';
+    definirEtapa(s, 'nacionalidade');
     return ['3️⃣ Nacionalidade?\nEx: Brasileiro'];
   }
 
   if (s.step === 'nacionalidade') {
     d.nacionalidade = txt;
-    s.step = 'estadoCivil';
+    definirEtapa(s, 'estadoCivil');
     return ['4️⃣ Estado civil?\n\nEx: Solteiro, Casado, Divorciado ou União Estável'];
   }
 
@@ -874,37 +967,37 @@ Vamos montar seu currículo profissional!
       return ['⚠️ Estado civil não reconhecido.\nDigite Solteiro, Casado, Divorciado, Viúvo, Separado ou União Estável.'];
 
     d.estadoCivil = v.valor;
-    s.step = 'rua';
+    definirEtapa(s, 'rua');
     return ['5️⃣ Nome da RUA / Avenida?\nEx: Rua das Flores'];
   }
 
   if (s.step === 'rua') {
     d.rua = txt;
-    s.step = 'numero';
+    definirEtapa(s, 'numero');
     return ['6️⃣ NÚMERO da casa?\nEx: 123'];
   }
 
   if (s.step === 'numero') {
     d.numero = txt;
-    s.step = 'complemento';
+    definirEtapa(s, 'complemento');
     return ['7️⃣ COMPLEMENTO?\n\nEx: Apto 101, Bloco B\nSe não tiver, digite *não*'];
   }
 
   if (s.step === 'complemento') {
     d.complemento = ['não','nao','sem','n','nenhum'].includes(lower) ? '' : txt;
-    s.step = 'bairro';
+    definirEtapa(s, 'bairro');
     return ['8️⃣ BAIRRO?\nEx: Centro'];
   }
 
   if (s.step === 'bairro') {
     d.bairro = txt;
-    s.step = 'cidade';
+    definirEtapa(s, 'cidade');
     return ['9️⃣ CIDADE?\nEx: São Paulo'];
   }
 
   if (s.step === 'cidade') {
     d.cidade = txt;
-    s.step = 'estado';
+    definirEtapa(s, 'estado');
     return ['🔟 ESTADO (sigla 2 letras)?\nEx: SP, RJ, MG'];
   }
 
@@ -913,7 +1006,7 @@ Vamos montar seu currículo profissional!
       return ['⚠️ Digite somente a sigla com 2 letras.\nEx: SP'];
 
     d.estado = txt.toUpperCase();
-    s.step = 'cep';
+    definirEtapa(s, 'cep');
     return ['1️⃣1️⃣ CEP?\n\nFormato: 00000-000\nEx: 08500-000\n\nPode digitar só números: 08500000'];
   }
 
@@ -923,7 +1016,7 @@ Vamos montar seu currículo profissional!
       return ['⚠️ CEP inválido!\nEx: 08500-000'];
 
     d.cep = cep;
-    s.step = 'telefone';
+    definirEtapa(s, 'telefone');
     return ['1️⃣2️⃣ TELEFONE / WhatsApp?\n\nEx: (11) 94204-7248\nPode digitar só números: 11942047248'];
   }
 
@@ -936,7 +1029,7 @@ Vamos montar seu currículo profissional!
       return ['⚠️ Telefone inválido!\nEx: (11) 94204-7248'];
 
     d.telefone = tel;
-    s.step = 'email';
+    definirEtapa(s, 'email');
     return ['1️⃣3️⃣ EMAIL?\n\nEx: joao@gmail.com'];
   }
 
@@ -946,31 +1039,31 @@ Vamos montar seu currículo profissional!
       return ['⚠️ Email inválido!\nEx: joao@gmail.com'];
 
     d.email = email;
-    s.step = 'objetivo';
+    definirEtapa(s, 'objetivo');
     return ['1️⃣4️⃣ Objetivo profissional?\n\nEx: Auxiliar administrativo, Vendedor, Motorista'];
   }
 
   if (s.step === 'objetivo') {
     d.objetivo = txt;
-    s.step = 'exp_empresa';
+    definirEtapa(s, 'exp_empresa');
     return ['1️⃣5️⃣ Nome da última empresa?\n\nSe for seu primeiro emprego digite *primeiro emprego*'];
   }
 
   if (s.step === 'exp_empresa') {
     if (lower.includes('primeiro')) {
       d.experiencias = [];
-      s.step = 'formacao';
+      definirEtapa(s, 'formacao');
       return ['Primeiro emprego 💪\n\nQual sua formação?\nEx: Ensino médio completo, Superior em Administração'];
     }
 
     s.expTemp.empresa = txt;
-    s.step = 'exp_cargo';
+    definirEtapa(s, 'exp_cargo');
     return [`Cargo na ${txt}?`];
   }
 
   if (s.step === 'exp_cargo') {
     s.expTemp.cargo = txt;
-    s.step = 'exp_inicio';
+    definirEtapa(s, 'exp_inicio');
     return ['Data INÍCIO?\nEx: 03/2022 ou 15/03/2022'];
   }
 
@@ -979,7 +1072,7 @@ Vamos montar seu currículo profissional!
     if (!v.ok) return [`⚠️ Data inválida!\n${v.erro}`];
 
     s.expTemp.inicio = v.valor;
-    s.step = 'exp_fim';
+    definirEtapa(s, 'exp_fim');
     return ['Data SAÍDA?\nEx: 12/2023\n\nOu digite *atual* se ainda trabalha lá.'];
   }
 
@@ -990,7 +1083,7 @@ Vamos montar seu currículo profissional!
     s.expTemp.fim = v.valor;
     d.experiencias.push({...s.expTemp});
     s.expTemp = {};
-    s.step = 'exp_mais';
+    definirEtapa(s, 'exp_mais');
 
     return ['✅ Empresa adicionada!\n\nTem mais empresas?\n\n1️⃣ Sim\n2️⃣ Não\n3️⃣ Pular\n\nVocê também pode digitar sim ou não.'];
   }
@@ -999,12 +1092,12 @@ Vamos montar seu currículo profissional!
     const escolha = respostaSimNao(txt);
 
     if (escolha === 'sim') {
-      s.step = 'exp_empresa';
+      definirEtapa(s, 'exp_empresa');
       return ['Próxima empresa?'];
     }
 
     if (escolha === 'nao' || escolha === 'pular') {
-      s.step = 'formacao';
+      definirEtapa(s, 'formacao');
       return ['Qual sua formação?'];
     }
 
@@ -1013,7 +1106,7 @@ Vamos montar seu currículo profissional!
 
   if (s.step === 'formacao') {
     d.formacao = txt;
-    s.step = 'curso_pergunta';
+    definirEtapa(s, 'curso_pergunta');
     return ['Tem cursos?\n\n1️⃣ Sim\n2️⃣ Não\n3️⃣ Pular\n\nVocê também pode digitar sim ou não.'];
   }
 
@@ -1021,12 +1114,12 @@ Vamos montar seu currículo profissional!
     const escolha = respostaSimNao(txt);
 
     if (escolha === 'sim') {
-      s.step = 'curso_nome';
+      definirEtapa(s, 'curso_nome');
       return ['Nome do curso?'];
     }
 
     if (escolha === 'nao' || escolha === 'pular') {
-      s.step = 'habilidades';
+      definirEtapa(s, 'habilidades');
       return ['💡 HABILIDADES - Opcional\n\nDigite suas habilidades ou *pular*.'];
     }
 
@@ -1035,13 +1128,13 @@ Vamos montar seu currículo profissional!
 
   if (s.step === 'curso_nome') {
     s.cursoTemp.nome = txt;
-    s.step = 'curso_inst';
+    definirEtapa(s, 'curso_inst');
     return [`Onde fez ${txt}?`];
   }
 
   if (s.step === 'curso_inst') {
     s.cursoTemp.instituicao = txt;
-    s.step = 'curso_ano';
+    definirEtapa(s, 'curso_ano');
     return ['Ano do curso?\nEx: 2023\n\nSe não lembrar, digite *não lembro*.'];
   }
 
@@ -1058,7 +1151,7 @@ Vamos montar seu currículo profissional!
 
     d.cursos.push({...s.cursoTemp});
     s.cursoTemp = {};
-    s.step = 'curso_mais';
+    definirEtapa(s, 'curso_mais');
 
     return ['✅ Curso adicionado!\n\nMais cursos?\n\n1️⃣ Sim\n2️⃣ Não\n3️⃣ Pular\n\nVocê também pode digitar sim ou não.'];
   }
@@ -1067,12 +1160,12 @@ Vamos montar seu currículo profissional!
     const escolha = respostaSimNao(txt);
 
     if (escolha === 'sim') {
-      s.step = 'curso_nome';
+      definirEtapa(s, 'curso_nome');
       return ['Próximo curso?'];
     }
 
     if (escolha === 'nao' || escolha === 'pular') {
-      s.step = 'habilidades';
+      definirEtapa(s, 'habilidades');
       return ['💡 HABILIDADES - Opcional\n\nDigite suas habilidades ou *pular*.'];
     }
 
@@ -1084,7 +1177,7 @@ Vamos montar seu currículo profissional!
       ['pular','nao','não','n','sem','nenhum'].includes(lower) ||
       lower.includes('pular') ? '' : txt;
 
-    s.step = 'resumo';
+    definirEtapa(s, 'resumo');
     return ['📝 RESUMO PROFISSIONAL - Opcional\n\nDigite seu resumo ou *pular*.'];
   }
 
@@ -1105,7 +1198,7 @@ Vamos montar seu currículo profissional!
     sessions.delete(jid);
 
     return [
-      `✅ Obrigado, ${d.nome}!\n\nSeu currículo foi recebido com sucesso!\n\n📧 Email: ${d.email}\n📱 Tel: ${d.telefone}\n\n🚀 Conexão v7cyber agradece seu cadastro!`,
+      `✅ Obrigado, ${d.nome}!\n\nSeu currículo foi recebido com sucesso!\n\n📧 Email: ${d.email}\n📱 Tel: ${d.telefone}\n\n🚀 Conexão v7cyber agradece seu cadastro!\n\nDigite *menu* para voltar às opções ou *fim* para encerrar o atendimento.`,
       '__CURRICULO_ENVIADO__'
     ];
   }
