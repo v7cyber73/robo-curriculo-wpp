@@ -258,14 +258,14 @@ ${d.nome}`;
 // ======================================================
 
 function menuPrincipal() {
-  return `👋 Olá! Seja bem-vindo à *Conexão v7cyber* 🤖
+  return `👋 Olá! Seja bem-vindo à *v7cyber* 🤖
 
 *Como podemos ajudar?*
 
-1️⃣ Horário de funcionamento
+1️⃣ Horário de Funcionamento
 2️⃣ Localização
-3️⃣ Tabela de preços
-4️⃣ Criar currículo
+3️⃣ Tabela de Preços
+4️⃣ Criar Currículo
 
 Digite *1, 2, 3 ou 4* para escolher.
 Durante a conversa, você pode digitar *menu* para ver estas opções novamente.`;
@@ -278,8 +278,8 @@ function respostaMenu(opcao) {
 
 📍 Rua Três Américas, 403 — Mauá/SP
 
-🗓️ Segunda a sexta: *até 17h*
-🗓️ Sábado: *10h às 17h*
+🗓️ Segunda a sexta: *10h às 17h*
+🗓️ Sábado: *10h às 13h*
 🍽️ Não fechamos para almoço.
 
 Digite *menu* para voltar às opções.`;
@@ -287,7 +287,7 @@ Digite *menu* para voltar às opções.`;
     case '2':
       return `📍 *LOCALIZAÇÃO*
 
-*Conexão v7cyber*
+*v7cyber*
 Rua Três Américas, 403
 Mauá — SP
 
@@ -322,17 +322,23 @@ Boletim de Ocorrência — *R$ 7,00*
 Abertura de MEI — *R$ 10,00*
 Nota Fiscal NFS-e — *R$ 5,00*
 
-📱 *CADASTROS E SERVIÇOS — R$ 5,00*
-Gov.br • Meu INSS • CNIS
-CNH Digital • Carteira de Trabalho Digital
+📱 *CADASTROS E SERVIÇOS 
+Gov.br — *R$ 5,00*
+Meu INSS — *R$ 5,00*
+CNIS — *R$ 5,00*
+CNH Digital — *R$ 5,00*
+Carteira de Trabalho Digital — *R$ 5,00*
 Agendamento Poupatempo — *R$ 5,00*
+Outros Cadastos e Agendamentos — *R$ 5,00*
 
 💳 *PAGAMENTO*
 Pix • Dinheiro • Cartão
 
 ❌ *NÃO FAZEMOS*
-Plastificação • Foto 3x4
-Encadernação • Entregas
+Plastificação
+Foto 3x4
+Encadernação
+Entregas
 
 Digite *menu* para voltar às opções.`;
 
