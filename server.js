@@ -322,14 +322,14 @@ Boletim de Ocorrência — *R$ 7,00*
 Abertura de MEI — *R$ 10,00*
 Nota Fiscal NFS-e — *R$ 5,00*
 
-📱 *CADASTROS E SERVIÇOS 
+📱 *CADASTROS E SERVIÇOS* 
 Gov.br — *R$ 5,00*
 Meu INSS — *R$ 5,00*
 CNIS — *R$ 5,00*
 CNH Digital — *R$ 5,00*
 Carteira de Trabalho Digital — *R$ 5,00*
 Agendamento Poupatempo — *R$ 5,00*
-Outros Cadastos e Agendamentos — *R$ 5,00*
+Outros Cadastros e Agendamentos — *R$ 5,00*
 
 💳 *PAGAMENTO*
 Pix • Dinheiro • Cartão
