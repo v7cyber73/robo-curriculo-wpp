@@ -1267,11 +1267,22 @@ async function iniciarWhatsApp() {
       }
 
       if (connection === 'close') {
-        isConnected = false;
-        whatsappSock = null;
-        log('❌ WhatsApp desconectado. Tentando reconectar em 5 segundos...');
-        setTimeout(() => iniciarWhatsApp(), 5000);
-      }
+  isConnected = false;
+  qrCodeData = null;
+  whatsappSock = null;
+
+  const erro = lastDisconnect?.error;
+  const codigo = erro?.output?.statusCode;
+
+  log(`❌ Conexão encerrada. Código: ${codigo ?? 'não informado'}`);
+  log(`Detalhe: ${erro?.message || 'sem mensagem de erro'}`);
+
+  if (codigo === 401) {
+    log('⚠️ Autenticação possivelmente inválida. Verifique a sessão antes de reconectar.');
+  }
+
+  setTimeout(() => iniciarWhatsApp(), 5000);
+}
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
