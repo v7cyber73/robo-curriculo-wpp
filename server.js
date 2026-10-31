@@ -358,9 +358,9 @@ Digite *menu* para voltar às opções.`;
 📍 Rua Três Américas, 403 — Mauá/SP
 
 🖨️ *XEROX E IMPRESSÃO*
-Xerox P&B — *R$ 0,75*
+Xerox P&B — *R$ 0,85*
 Xerox colorida — *R$ 1,00*
-Impressão P&B — *R$ 1,00*
+Impressão P&B — *R$ 1,50*
 Frente e verso — *R$ 1,15*
 
 📄 *SCANNER*
@@ -370,14 +370,14 @@ Acima de 8 folhas — *R$ 8,00*
 📲 Envio pelo WhatsApp incluso.
 
 📋 *CURRÍCULO*
-Currículo — *R$ 10,00*
+Currículo — *R$ 8,00*
 ⏱️ Prazo: até 2 horas
 ✅ Primeiro emprego e Jovem Aprendiz
 
 💻 *SERVIÇOS DIGITAIS*
 Segunda via de contas — *R$ 5,00*
 Consulta na internet — *R$ 3,00*
-Impressão de consulta — *R$ 1,00 por folha*
+Impressão de consulta — *+R$ 1,00 por folha*
 Boletim de Ocorrência — *R$ 7,00*
 Abertura de MEI — *R$ 10,00*
 Nota Fiscal NFS-e — *R$ 5,00*
