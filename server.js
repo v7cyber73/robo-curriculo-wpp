@@ -1409,6 +1409,11 @@ async function iniciarWhatsApp() {
           }
 
           const jid = m.key.remoteJid;
+         log('V7 DIAGNOSTICO JID: ' + JSON.stringify({
+         tipo: jid?.split('@')[1],
+          alternativoTipo: m.key.remoteJidAlt?.split('@')[1] || null,
+          alternativoPresente: !!m.key.remoteJidAlt
+        }));
           if (!jid || jid.endsWith('@g.us') || jid === 'status@broadcast') continue;
 
           const txt = (
