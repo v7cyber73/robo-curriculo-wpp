@@ -769,11 +769,37 @@ function bridgeAuth(req, res, next) {
   next();
 }
 function bridgeOnline() { return bridgeToken.length >= 32 && Date.now() - bridgeSeen < BRIDGE_TTL; }
+const lidPhones = new Map();
 function bridgePhone(jid) {
-  if (!jid || !jid.endsWith('@s.whatsapp.net')) return null;
-  const n = jid.split('@')[0].split(':')[0];
+  if (typeof jid !== 'string') return null;
+  let phoneJid = jid;
+  if (jid.endsWith('@lid')) {
+    const entry = lidPhones.get(jid);
+    if (!entry || Date.now() - entry.at > 4 * 60 * 60 * 1000) {
+      lidPhones.delete(jid);
+      return null;
+    }
+    phoneJid = entry.phoneJid;
+  }
+  if (!phoneJid.endsWith('@s.whatsapp.net')) return null;
+  const n = phoneJid.split('@')[0].split(':')[0];
   return /^\d{10,15}$/.test(n) ? n : null;
 }
+async function bridgeResolveLid(sock, message) {
+  const jid = message.key?.remoteJid;
+  if (!jid?.endsWith('@lid')) return;
+  const mapping = sock.signalRepository?.lidMapping;
+  let candidate = message.key?.remoteJidAlt;
+  if (!candidate?.endsWith('@s.whatsapp.net') && typeof mapping?.getPNForLID === 'function') {
+    try { candidate = await mapping.getPNForLID(jid); }
+    catch (_) { candidate = null; }
+  }
+  if (typeof candidate !== 'string' || !candidate.endsWith('@s.whatsapp.net')) return;
+  const n = candidate.split('@')[0].split(':')[0];
+  if (!/^\d{10,15}$/.test(n)) return;
+  lidPhones.set(jid, {phoneJid: candidate, at: Date.now()});
+}
+
 function bridgeClean() {
   const now = Date.now();
   for (const [id, job] of bridgeJobs) {
@@ -799,7 +825,7 @@ app.get('/v7bridge/jobs', bridgeAuth, (req,res) => {
     if (job.status !== 'pending' || jobs.length >= 3) continue;
     job.attempts = (job.attempts || 0) + 1;
     job.status = 'leased'; job.leaseUntil = now + BRIDGE_LEASE_MS; job.leaseToken = crypto.randomUUID();
-    jobs.push({id:job.id,jid:job.jid,name:job.name,cpf4:job.cpf4,leaseToken:job.leaseToken});
+    jobs.push({id:job.id,jid:job.jid,phone:job.phone,name:job.name,cpf4:job.cpf4,leaseToken:job.leaseToken});
   }
   res.json(jobs);
 });
@@ -866,7 +892,7 @@ async function processarMensagem(jid, txt) {
     if (!phone || !bridgeOnline() || !isConnected) { sessions.delete(jid); return ['O envio de PDF está temporariamente indisponível. Tente novamente durante nosso horário de atendimento.']; }
     if ([...bridgeJobs.values()].some(j=>j.jid===jid)) { sessions.delete(jid); return ['Você já tem uma solicitação em andamento. Aguarde alguns instantes.']; }
     const id = crypto.randomUUID();
-    bridgeJobs.set(id,{id,jid,name:s.pdfNome,cpf4:txt.trim(),status:'pending',created:Date.now()});
+    bridgeJobs.set(id,{id,jid,phone,name:s.pdfNome,cpf4:txt.trim(),status:'pending',created:Date.now()});
     sessions.delete(jid);
     return ['Solicitação recebida. Se seu número estiver previamente autorizado, tentaremos enviar seu PDF em instantes.'];
   }
@@ -1409,12 +1435,8 @@ async function iniciarWhatsApp() {
           }
 
           const jid = m.key.remoteJid;
-         log('V7 DIAGNOSTICO JID: ' + JSON.stringify({
-         tipo: jid?.split('@')[1],
-          alternativoTipo: m.key.remoteJidAlt?.split('@')[1] || null,
-          alternativoPresente: !!m.key.remoteJidAlt
-        }));
           if (!jid || jid.endsWith('@g.us') || jid === 'status@broadcast') continue;
+          await bridgeResolveLid(sock, m);
 
           const txt = (
             m.message.conversation ||
