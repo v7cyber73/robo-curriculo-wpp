@@ -1337,6 +1337,13 @@ const {
 } = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 const fs = require('fs');
+const path = require('path');
+// Altere V7_AUTH_DIR no Render para iniciar uma nova sessão, sem Shell.
+const AUTH_DIR_NAME = String(process.env.V7_AUTH_DIR || 'auth').trim();
+if (!/^[a-zA-Z0-9_-]{1,64}$/.test(AUTH_DIR_NAME)) {
+  throw new Error('V7_AUTH_DIR deve conter somente letras, números, _ ou -');
+}
+const AUTH_DIR = path.join(process.cwd(), AUTH_DIR_NAME);
 
 let qrCodeData = null;
 let isConnected = false;
@@ -1366,7 +1373,7 @@ function log(msg) {
 
 async function iniciarWhatsApp() {
   try {
-    const { state, saveCreds } = await useMultiFileAuthState('./auth');
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
     let version;
     try {
@@ -1412,7 +1419,9 @@ async function iniciarWhatsApp() {
   log(`Detalhe: ${erro?.message || 'sem mensagem de erro'}`);
 
   if (codigo === 401) {
-    log('⚠️ Autenticação possivelmente inválida. Verifique a sessão antes de reconectar.');
+    log('⚠️ Sessão WhatsApp inválida. Reconexão suspensa para evitar loop.');
+    log('🔑 Para renovar sem Shell, altere V7_AUTH_DIR no Render para um novo nome e faça deploy.');
+    return;
   }
 
   setTimeout(() => iniciarWhatsApp(), 5000);
