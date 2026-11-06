@@ -1428,6 +1428,23 @@ async function iniciarWhatsApp() {
 }
     });
 
+    // Respostas: usar o JID telefônico apenas se o próprio Baileys o associou ao LID.
+    async function enviarRespostaSegura(jid, payload) {
+      const associado = jid.endsWith('@lid') ? lidPhones.get(jid) : null;
+      const numeroConfirmado = associado && Date.now() - associado.at < 4 * 60 * 60 * 1000
+        ? associado.phoneJid : null;
+      // Para LID, tentar primeiro o número confirmado: evita "No sessions" no LID.
+      const destino = numeroConfirmado || jid;
+      try {
+        return await sock.sendMessage(destino, payload);
+      } catch (e) {
+        if (String(e?.message || '').includes('No sessions')) {
+          log(`⚠️ Sessão de criptografia indisponível para ${jid.endsWith('@lid') ? 'LID' : 'telefone'}; mapeamento telefônico ${numeroConfirmado ? 'disponível' : 'ausente'}.`);
+        }
+        throw e;
+      }
+    }
+
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type && type !== 'notify') return;
       for (const m of messages) {
@@ -1446,6 +1463,9 @@ async function iniciarWhatsApp() {
           const jid = m.key.remoteJid;
           if (!jid || jid.endsWith('@g.us') || jid === 'status@broadcast') continue;
           await bridgeResolveLid(sock, m);
+          if (jid.endsWith('@lid') && !bridgePhone(jid)) {
+            log('⚠️ WhatsApp enviou @lid sem associação telefônica confirmada; envio pode falhar.');
+          }
 
           const txt = (
             m.message.conversation ||
@@ -1466,7 +1486,7 @@ async function iniciarWhatsApp() {
               continue;
             }
 
-            await sock.sendMessage(jid, { text: reply });
+            await enviarRespostaSegura(jid, { text: reply });
           }
 
           // Quando o currículo termina, processarMensagem já colocou
