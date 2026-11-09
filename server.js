@@ -1,865 +1,264 @@
-const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason } = require('@whiskeysockets/baileys')
-// Logs internos do Baileys são silenciados pelo whatsappLogger abaixo.
-// O console.error não é interceptado para evitar ocultar falhas importantes.
-const express = require('express')
-const QRCode = require('qrcode')
-const fs = require('fs')
-const path = require('path')
+const express = require('express');
+const crypto = require('crypto');
 
-// Não registrar conversas, mensagens, números nem identificadores @lid.
-// O Baileys continua funcionando; apenas os logs internos verbosos são silenciados.
-const whatsappLogger = {
-  level: 'silent',
-  child() { return this },
-  trace() {}, debug() {}, info() {}, warn() {}, error() {}, fatal() {}
+const app = express();
+const PORT = process.env.PORT || 10000;
+
+app.use(express.json({limit:"11mb"}));
+app.use(express.urlencoded({ extended: true }));
+
+// ======================================================
+// PROTEÇÃO DO PAINEL ADMINISTRATIVO
+// Configure ADMIN_PASSWORD nas variáveis de ambiente do Render.
+// Não coloque a senha diretamente neste arquivo.
+// ======================================================
+const ADMIN_USER = process.env.ADMIN_USER || 'admin';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+
+function compararSeguramente(a, b) {
+  const ba = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
 }
 
-const app = express()
-const PORT = process.env.PORT || 10000
-
-let qrCodeData = null
-let isConnected = false
-let sockAtual = null
-let reconnectTimer = null
-let starting = false
-let logs = []
-const sessions = new Map()
-
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || ''
-const DESTINO_CURRICULOS = process.env.DESTINO_CURRICULOS || '5511942047248@s.whatsapp.net'
-const AUTH_DIR = './auth-teste-11954741892'
-
-function log(m) {
-  const l = `[${new Date().toLocaleTimeString()}] ${m}`
-  console.log(l)
-  logs.push(l)
-  if (logs.length > 200) logs.shift()
-}
-
-try {
-  if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true })
-} catch (e) {
-  log('Erro ao preparar autenticação do WhatsApp')
-}
-
-function getSession(jid) {
-  if (!sessions.has(jid)) {
-    sessions.set(jid, {
-      step: 'idle',
-      data: { experiencias: [], cursos: [] },
-      expTemp: {},
-      cursoTemp: {}
-    })
+function protegerPainel(req, res, next) {
+  if (!ADMIN_PASSWORD || ADMIN_PASSWORD.length < 12) {
+    return res.status(503).send(
+      'Painel bloqueado: configure ADMIN_PASSWORD com pelo menos 12 caracteres nas variáveis de ambiente do Render.'
+    );
   }
-  return sessions.get(jid)
-}
 
-function novoCadastro() {
-  return {
-    step: 'nome',
-    data: { experiencias: [], cursos: [] },
-    expTemp: {},
-    cursoTemp: {},
-    history: []
-  }
-}
-
-function pushStep(s, step) {
-  if (s.step && s.step !== step) s.history.push(s.step)
-  s.step = step
-}
-
-function voltarPasso(s) {
-  if (!s.history.length) return null
-  s.step = s.history.pop()
-  return s.step
-}
-
-function normalizarTexto(txt) {
-  return String(txt || '').trim().replace(/\s+/g, ' ')
-}
-
-function semAcentos(txt) {
-  return normalizarTexto(txt).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
-}
-
-// ---------- VALIDADORES ----------
-
-function calcularIdade(data) {
-  const hoje = new Date()
-  let idade = hoje.getFullYear() - data.getFullYear()
-  const antesDoAniversario =
-    hoje.getMonth() < data.getMonth() ||
-    (hoje.getMonth() === data.getMonth() && hoje.getDate() < data.getDate())
-  if (antesDoAniversario) idade--
-  return idade
-}
-
-function validarDataNascimento(txt) {
-  txt = normalizarTexto(txt)
-
-  let d, m, a, tipo
-
-  if (/^\d{2}\/\d{2}\/\d{4}$/.test(txt)) {
-    ;[d, m, a] = txt.split('/').map(Number)
-    tipo = 'completa'
-  } else if (/^\d{2}\/\d{4}$/.test(txt)) {
-    ;[m, a] = txt.split('/').map(Number)
-    d = 1
-    tipo = 'mes'
-  } else if (/^\d{4}$/.test(txt)) {
-    a = Number(txt)
-    m = 1
-    d = 1
-    tipo = 'ano'
-  } else {
-    return {
-      ok: false,
-      erro: 'Use DD/MM/AAAA, MM/AAAA ou somente AAAA.'
+  const header = req.headers.authorization || '';
+  if (header.startsWith('Basic ')) {
+    let credenciais = '';
+    try {
+      credenciais = Buffer.from(header.slice(6), 'base64').toString('utf8');
+    } catch (_) {}
+    const separador = credenciais.indexOf(':');
+    if (separador >= 0) {
+      const usuario = credenciais.slice(0, separador);
+      const senha = credenciais.slice(separador + 1);
+      if (compararSeguramente(usuario, ADMIN_USER) && compararSeguramente(senha, ADMIN_PASSWORD)) {
+        return next();
+      }
     }
   }
 
-  const hoje = new Date()
-  const anoAtual = hoje.getFullYear()
-
-  if (a < 1920 || a > anoAtual) {
-    return { ok: false, erro: `Ano inválido. Use entre 1920 e ${anoAtual}.` }
-  }
-  if (m < 1 || m > 12) return { ok: false, erro: 'Mês inválido (01 a 12).' }
-
-  const diasNoMes = new Date(a, m, 0).getDate()
-  if (d < 1 || d > diasNoMes) return { ok: false, erro: 'Dia inválido para o mês informado.' }
-
-  // Para mês/ano e somente ano, usamos o início do período para cálculo conservador.
-  const nascimento = new Date(a, m - 1, d)
-  if (nascimento > hoje) return { ok: false, erro: 'A data não pode estar no futuro.' }
-
-  const idade = calcularIdade(nascimento)
-  if (idade < 12) return { ok: false, erro: 'A idade mínima para este cadastro é 12 anos.' }
-  if (idade > 100) return { ok: false, erro: 'Verifique o ano informado.' }
-
-  let exibicao = txt
-  if (tipo === 'completa') exibicao = txt
-  if (tipo === 'mes') exibicao = txt
-  if (tipo === 'ano') exibicao = txt
-
-  return { ok: true, valor: exibicao, idade }
+  res.set('WWW-Authenticate', 'Basic realm="Painel Conexão v7cyber", charset="UTF-8"');
+  return res.status(401).send('Acesso restrito. Informe o usuário e a senha do painel.');
 }
 
-function validarDataExp(txt, permitirAtual = true) {
-  txt = normalizarTexto(txt)
-  const lower = semAcentos(txt)
+// Protege todas as páginas e endpoints administrativos, incluindo QR, logs e currículos.
+app.get('/', protegerPainel, (req, res, next) => next());
+app.use(['/whatsapp', '/qr', '/status', '/logs', '/admin'], protegerPainel);
 
-  if (permitirAtual && ['atual', 'presente', 'hoje', 'atualmente', 'ainda trabalho', 'atualidade'].includes(lower)) {
-    return { ok: true, valor: 'Atual', data: null }
+// ======================================================
+// SESSÕES DO SIMULADOR
+// ======================================================
+const sessions = new Map();
+let adminMessages = [];
+const LIMITE_INATIVIDADE_MS = 4 * 60 * 60 * 1000;
+
+// Limpa cadastros abandonados após 4 horas e evita crescimento ilimitado da memória.
+setInterval(() => {
+  const agora = Date.now();
+  for (const [jid, sessao] of sessions) {
+    if (!sessao.lastActivityAt || agora - sessao.lastActivityAt >= LIMITE_INATIVIDADE_MS) {
+      sessions.delete(jid);
+    }
   }
+}, 15 * 60 * 1000).unref();
 
-  let d, m, a
+function getSession(id) {
+  if (!sessions.has(id)) {
+    sessions.set(id, {
+      step: 'idle',
+      menuExibido: false,
+      menuPendente: false,
+      lastActivityAt: 0,
+      data: {
+        experiencias: [],
+        cursos: []
+      },
+      expTemp: {},
+      cursoTemp: {}
+    });
+  }
+  return sessions.get(id);
+}
+
+// ======================================================
+// VALIDAÇÕES
+// ======================================================
+function validarDataNascimento(txt) {
+  if (!/^\d{2}\/\d{2}\/\d{4}$/.test(txt))
+    return { ok: false, erro: 'Formato deve ser DD/MM/AAAA' };
+
+  const [d, m, a] = txt.split('/').map(Number);
+
+  if (m < 1 || m > 12)
+    return { ok: false, erro: 'Mês inválido' };
+
+  if (a < 1920 || a > new Date().getFullYear())
+    return { ok: false, erro: 'Ano inválido' };
+
+  const dias = [
+    31,
+    (a % 4 === 0 && a % 100 !== 0 || a % 400 === 0) ? 29 : 28,
+    31,30,31,30,31,31,30,31,30,31
+  ];
+
+  if (d < 1 || d > dias[m - 1])
+    return { ok: false, erro: 'Dia inválido para o mês informado' };
+
+  const hoje = new Date();
+  const nasc = new Date(a, m - 1, d);
+
+  if (nasc > hoje)
+    return { ok: false, erro: 'Data de nascimento não pode ser no futuro' };
+
+  let idade = hoje.getFullYear() - a;
+  if (
+    hoje.getMonth() < m - 1 ||
+    (hoje.getMonth() === m - 1 && hoje.getDate() < d)
+  ) idade--;
+
+  if (idade < 12)
+    return { ok: false, erro: 'Idade mínima 12 anos' };
+
+  if (idade > 100)
+    return { ok: false, erro: 'Verifique a data de nascimento' };
+
+  return { ok: true, idade };
+}
+
+function validarDataExp(txt) {
+  const lower = txt.toLowerCase().trim();
+
+  if (['atual','presente','hoje','atualmente','atualidade'].includes(lower))
+    return { ok: true, valor: 'Atual' };
 
   if (/^\d{2}\/\d{2}\/\d{4}$/.test(txt)) {
-    ;[d, m, a] = txt.split('/').map(Number)
-  } else if (/^\d{2}\/\d{4}$/.test(txt)) {
-    ;[m, a] = txt.split('/').map(Number)
-    d = 1
-  } else if (/^\d{4}$/.test(txt)) {
-    a = Number(txt)
-    m = 1
-    d = 1
-  } else {
-    return { ok: false, erro: 'Formato inválido. Use DD/MM/AAAA, MM/AAAA ou AAAA.' }
+    const [d,m,a] = txt.split('/').map(Number);
+    const dias = [
+      31,
+      (a % 4 === 0 && a % 100 !== 0 || a % 400 === 0) ? 29 : 28,
+      31,30,31,30,31,31,30,31,30,31
+    ];
+    if (m < 1 || m > 12 || d < 1 || d > dias[m-1])
+      return { ok:false, erro:'Data inválida' };
+    return { ok:true, valor:txt };
   }
 
-  const anoAtual = new Date().getFullYear()
-  if (a < 1900 || a > anoAtual) return { ok: false, erro: `Ano inválido. Use entre 1900 e ${anoAtual}.` }
-  if (m < 1 || m > 12) return { ok: false, erro: 'Mês inválido (01 a 12).' }
-
-  const dias = new Date(a, m, 0).getDate()
-  if (d < 1 || d > dias) return { ok: false, erro: 'Dia inválido para o mês informado.' }
+  if (/^\d{2}\/\d{4}$/.test(txt)) {
+    const [m,a] = txt.split('/').map(Number);
+    if (m < 1 || m > 12)
+      return { ok:false, erro:'Mês inválido' };
+    return { ok:true, valor:txt };
+  }
 
   return {
-    ok: true,
-    valor: txt,
-    data: new Date(a, m - 1, d)
-  }
-}
-
-function compararDatasInicioFim(inicio, fim) {
-  if (!inicio?.data || !fim?.data || fim.valor === 'Atual') return true
-  return fim.data >= inicio.data
+    ok:false,
+    erro:'Use MM/AAAA, DD/MM/AAAA ou digite atual'
+  };
 }
 
 function validarEstadoCivil(txt) {
-  const lower = semAcentos(txt)
+  const lower = txt.toLowerCase().trim();
   const opcoes = {
-    solteiro: 'Solteiro(a)', solteira: 'Solteiro(a)',
-    casado: 'Casado(a)', casada: 'Casado(a)',
-    divorciado: 'Divorciado(a)', divorciada: 'Divorciado(a)',
-    viuvo: 'Viúvo(a)', viuva: 'Viúvo(a)',
-    separado: 'Separado(a)', separada: 'Separado(a)',
-    'uniao estavel': 'União Estável',
-    uniao: 'União Estável',
-    amasiado: 'União Estável', amasiada: 'União Estável'
+    solteiro:'Solteiro(a)',
+    solteira:'Solteiro(a)',
+    casado:'Casado(a)',
+    casada:'Casado(a)',
+    divorciado:'Divorciado(a)',
+    divorciada:'Divorciado(a)',
+    viuvo:'Viúvo(a)',
+    viúvo:'Viúvo(a)',
+    viuva:'Viúvo(a)',
+    viúva:'Viúvo(a)',
+    separado:'Separado(a)',
+    separada:'Separado(a)',
+    'uniao estavel':'União Estável',
+    'união estável':'União Estável'
+  };
+
+  if (opcoes[lower]) return { ok:true, valor:opcoes[lower] };
+
+  for (const k of Object.keys(opcoes)) {
+    if (lower.includes(k))
+      return { ok:true, valor:opcoes[k] };
   }
-  if (opcoes[lower]) return { ok: true, valor: opcoes[lower] }
-  return { ok: false }
+
+  return { ok:false };
 }
 
 function validarAno(txt) {
-  txt = normalizarTexto(txt)
-  if (!/^\d{4}$/.test(txt)) return { ok: false, erro: 'Digite somente o ano com 4 números.' }
-  const a = Number(txt)
-  const anoAtual = new Date().getFullYear()
-  if (a < 1900 || a > anoAtual) return { ok: false, erro: `Ano inválido (1900 a ${anoAtual}).` }
-  return { ok: true, valor: txt }
-}
+  if (!/^\d{4}$/.test(txt))
+    return { ok:false, erro:'Digite o ano com 4 números' };
 
-function validarNome(txt) {
-  txt = normalizarTexto(txt)
-  const partes = txt.split(' ')
-  if (partes.length < 2) return { ok: false, erro: 'Digite nome e sobrenome completo.' }
-  if (!/^[A-Za-zÀ-ÖØ-öø-ÿ'’-]+(?: [A-Za-zÀ-ÖØ-öø-ÿ'’-]+)+$/.test(txt)) {
-    return { ok: false, erro: 'Use somente letras, espaços e acentos no nome.' }
-  }
-  return { ok: true, valor: txt }
+  const a = Number(txt);
+  if (a < 1980 || a > new Date().getFullYear())
+    return { ok:false, erro:'Ano inválido' };
+
+  return { ok:true };
 }
 
 function formatarCEP(txt) {
-  const num = txt.replace(/[^0-9]/g, '')
-  return num.length === 8 ? `${num.substring(0, 5)}-${num.substring(5)}` : txt
+  const n = txt.replace(/\D/g,'');
+  return n.length === 8 ? n.slice(0,5) + '-' + n.slice(5) : txt;
 }
 
 function validarCEP(txt) {
-  return /^\d{5}-\d{3}$/.test(txt)
+  return /^\d{5}-\d{3}$/.test(txt);
 }
 
 function formatarTelefone(txt) {
-  const num = txt.replace(/[^0-9]/g, '')
-  if (num.length === 11) return `(${num.substring(0, 2)}) ${num.substring(2, 7)}-${num.substring(7)}`
-  if (num.length === 10) return `(${num.substring(0, 2)}) ${num.substring(2, 6)}-${num.substring(6)}`
-  return null
+  const n = txt.replace(/\D/g,'');
+  if (n.length === 11)
+    return `(${n.slice(0,2)}) ${n.slice(2,7)}-${n.slice(7)}`;
+  if (n.length === 10)
+    return `(${n.slice(0,2)}) ${n.slice(2,6)}-${n.slice(6)}`;
+  return null;
 }
 
-function validarTelefoneFormatado(txt) {
-  return /^\(\d{2}\) \d{4,5}-\d{4}$/.test(txt)
+function validarTelefone(txt) {
+  return /^\(\d{2}\) \d{4,5}-\d{4}$/.test(txt);
 }
 
 function validarEmail(txt) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(txt)
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(txt);
 }
 
-function opcional(txt) {
-  return ['nao', 'não', 'n', 'sem', 'nenhum', 'nenhuma', 'nao informado', 'não informado', 'nao sei', 'não sei', 'nao lembro', 'não lembro', 'esqueci'].includes(semAcentos(txt))
-}
-
-
-// ---------- ATENDIMENTO / MENU PRINCIPAL ----------
-
-const HORARIOS = `🕐 *HORÁRIO DE FUNCIONAMENTO*
-
-📅 Segunda a sexta: 10:00 às 17:00
-📅 Sábado: 10:00 às 13:00
-🚫 Domingo e feriados: fechado`
-
-const PRECOS = `💰 *TABELA DE PREÇOS*
-
-1️⃣ Impressão preto e branco — R$ 1,00
-2️⃣ Impressão colorida frente e verso — R$ 1,15
-3️⃣ Escâner:
-• Até 3 folhas — R$ 2,00
-• De 4 a 8 folhas — R$ 5,00
-• Acima de 8 folhas — R$ 8,00
-4️⃣ Antecedentes Criminais — R$ 5,00
-5️⃣ MEI — R$ 8,00
-6️⃣ Cópias — R$ 0,70
-7️⃣ Boletim de ocorrência — R$ 8,00
-8️⃣ Curriculum — R$ 8,00
-
-Para criar seu *Curriculum*, digite exatamente:
-👉 *Criar Curriculum*`
-
-function mensagemMenu() {
-  return `👋 Olá! Seja bem-vindo(a) à *Conexão v7cyber* 🤖
-
-Como podemos ajudar?
-
-1️⃣ *Consultar preços*
-2️⃣ *Horário de funcionamento*
-3️⃣ *Falar com atendente*
-
-Digite o número da opção ou escreva o que precisa.
-
-📌 Para fazer seu Curriculum de R$ 8,00, digite:
-*Criar Curriculum*`
-}
-
-function respostaPreco(txt) {
-  const t = semAcentos(txt)
-
-  if (
-    t.includes('scanner') || t.includes('scan') ||
-    t.includes('escaner') || t.includes('escan') || t.includes('escane')
-  ) return `📄 *ESCÂNER*\n\n• Até 3 folhas: R$ 2,00\n• De 4 a 8 folhas: R$ 5,00\n• Acima de 8 folhas: R$ 8,00`
-
-  if (t.includes('antecedente') || t.includes('antecedentes')) return '📄 *Antecedentes Criminais:* R$ 5,00'
-  if (t === 'mei' || t.includes('mei')) return '📄 *MEI:* R$ 8,00'
-  if (t.includes('copia') || t.includes('copias')) return '📄 *Cópia:* R$ 0,70'
-  if (t.includes('boletim') || t.includes('ocorrencia')) return '📄 *Boletim de ocorrência:* R$ 8,00'
-  if (t.includes('curriculum') || t.includes('curriculo')) return '📄 *Curriculum:* R$ 8,00\n\nPara iniciar, digite *Criar Curriculum*.'
-  if (t.includes('preco') || t.includes('precos')) return PRECOS
-
-  // A regra de colorida/frente e verso vem ANTES da regra genérica
-  // de impressão para não responder R$ 1,00 por engano.
-  if (
-    t.includes('colorida') || t.includes('colorido') ||
-    t.includes('frente e verso') || t.includes('frente verso')
-  ) {
-    return '🖨️ *Impressão colorida frente e verso:* R$ 1,15'
-  }
-
-  if (
-    t.includes('impressao') || t.includes('imprimir') ||
-    t.includes('preto e branco') || t.includes('preto branco') || t.includes('pb')
-  ) return '🖨️ *Impressão preto e branco:* R$ 1,00'
-
-  return null
-}
-
-function ehHorario(txt) {
-  const t = semAcentos(txt)
-  return t.includes('horario') || t.includes('funcionamento') || t.includes('abre') ||
-    t.includes('fecha') || t.includes('aberto')
-}
-
-function ehAtendente(txt) {
-  const t = semAcentos(txt)
-  return t.includes('atendente') || t.includes('atendimento') || t.includes('falar com') ||
-    t.includes('pessoa') || t.includes('humano')
-}
-
-function ehSaudacao(txt) {
-  const t = semAcentos(txt)
-  return ['oi','ola','bom dia','boa tarde','boa noite','menu','ajuda','inicio','comecar'].includes(t)
-}
-
-function ehPerguntaDesconhecida(txt) {
-  const t = semAcentos(txt)
-  return t.length > 2 && (
-    t.includes('quanto') || t.includes('valor') || t.includes('preco') ||
-    t.includes('precos') || t.includes('faz') || t.includes('fazer')
-  )
-}
-
-// ---------- WHATSAPP ----------
-
-async function agendarReconexao() {
-  if (reconnectTimer || starting) return
-  reconnectTimer = setTimeout(async () => {
-    reconnectTimer = null
-    try {
-      await startBot()
-    } catch (e) {
-      log('Erro ao reconectar WhatsApp')
-      agendarReconexao()
-    }
-  }, 5000)
-}
-
-async function startBot() {
-  if (starting) return sockAtual
-  starting = true
-
-  try {
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
-    let version
-    try {
-      version = (await fetchLatestBaileysVersion()).version
-    } catch (e) {
-      version = [2, 3000, 1023223821]
-      log('Não foi possível obter a versão Baileys; usando fallback.')
-    }
-
-    const sock = makeWASocket({
-      version,
-      auth: state,
-      logger: whatsappLogger,
-      browser: ['Conexão v7cyber', 'Chrome', '122'],
-      markOnlineOnConnect: false,
-      syncFullHistory: false,
-      generateHighQualityLinkPreview: false
-    })
-
-    sockAtual = sock
-    sock.ev.on('creds.update', saveCreds)
-
-    // Evento específico de chamadas do Baileys.
-    // A mensagem de chamada nem sempre chega em messages.upsert.
-    sock.ev.on('call', async (calls) => {
-      for (const call of calls || []) {
-        if (call.status !== 'offer' || !call.from) continue
-        log('Chamada recebida')
-        await sock.sendMessage(call.from, {
-          text: '📞 Não conseguimos atender chamadas por aqui. Por favor, envie uma mensagem de texto ou áudio.'
-        }).catch((e) => log('Erro ao responder chamada'))
-      }
-    })
-
-    sock.ev.on('connection.update', async (u) => {
-      if (u.qr) {
-        qrCodeData = u.qr
-        isConnected = false
-        log('QR gerado - escaneie em /whatsapp')
-      }
-
-      if (u.connection === 'open') {
-        isConnected = true
-        qrCodeData = null
-        starting = false
-        log('✅ WhatsApp conectado - pronto para atendimento')
-      }
-
-      if (u.connection === 'close') {
-        isConnected = false
-        qrCodeData = null
-        starting = false
-
-        if (sockAtual === sock) sockAtual = null
-
-        const statusCode = u.lastDisconnect?.error?.output?.statusCode
-        if (statusCode === DisconnectReason.loggedOut) {
-          log('⚠️ Sessão encerrada no WhatsApp. Faça novo pareamento em /whatsapp.')
-          return
-        }
-
-        log('🔄 Desconectado - reconexão única em 5s')
-        agendarReconexao()
-      }
-    })
-
-    sock.ev.on('messages.upsert', async (up) => {
-      for (const m of up.messages) {
-        if (!m.message) continue
-        const jid = m.key.remoteJid
-        if (!jid || jid.includes('@g.us') || m.key.fromMe) continue
-
-        const txt = normalizarTexto(
-          m.message.conversation ||
-          m.message.extendedTextMessage?.text ||
-          ''
-        )
-        const lower = txt.toLowerCase()
-        const lowerSemAcento = semAcentos(txt)
-
-        // Áudio
-        if (m.message.audioMessage) {
-          await sock.sendMessage(jid, { text: '🎧 Recebi seu áudio! Assim que possível, vou responder. Se preferir, também pode enviar sua mensagem por texto.' })
-          continue
-        }
-
-        // Chamadas
-        if (m.message.call) {
-          await sock.sendMessage(jid, { text: '📞 Não conseguimos atender chamadas por aqui. Por favor, envie uma mensagem de texto ou áudio.' }).catch(() => {})
-          continue
-        }
-
-        if (!txt) continue
-
-        // Sem log do conteúdo, número, JID ou LID da conversa.
-
-        const comandosSair = ['sair', 'cancelar', 'parar', 'desistir', 'exit', 'cancel', 'stop', 'sai', 'cancela']
-        if (comandosSair.includes(lowerSemAcento) || lowerSemAcento.includes('quero sair') || lowerSemAcento.includes('quero cancelar')) {
-          const sess = sessions.get(jid)
-          if (sess && sess.step !== 'idle') {
-            sessions.delete(jid)
-            await sock.sendMessage(jid, { text: '❌ Cadastro cancelado com sucesso!\n\nSe quiser recomeçar, digite *Criar Curriculum*.' })
-          } else {
-            await sock.sendMessage(jid, { text: '👋 Você não está em nenhum cadastro.\n\nDigite *Criar Curriculum* para começar.' })
-          }
-          continue
-        }
-
-        // VOLTAR
-        if (lowerSemAcento === 'voltar' || lowerSemAcento === 'volta') {
-          const sess = sessions.get(jid)
-          if (!sess || sess.step === 'idle') {
-            await sock.sendMessage(jid, { text: 'ℹ️ Você não está preenchendo um currículo no momento.' })
-            continue
-          }
-          const anterior = voltarPasso(sess)
-          if (!anterior) {
-            await sock.sendMessage(jid, { text: 'ℹ️ Você já está na primeira pergunta.' })
-            continue
-          }
-          sess.expTemp = {}
-          sess.cursoTemp = {}
-          await sock.sendMessage(jid, { text: `↩️ Voltamos uma etapa.\n\n${mensagemDaEtapa(anterior, sess)}` })
-          continue
-        }
-
-        // ---------- MENU / ATENDIMENTO ----------
-        // O menu só atua quando o cliente não está preenchendo um currículo.
-        const sessAtual = sessions.get(jid)
-        const emCurriculo = sessAtual && sessAtual.step !== 'idle'
-
-        if (!emCurriculo) {
-          if (ehSaudacao(txt)) {
-            await sock.sendMessage(jid, { text: mensagemMenu() })
-            continue
-          }
-
-          if (lowerSemAcento === '1' || lowerSemAcento === '1️⃣' || lowerSemAcento.includes('consultar prec')) {
-            await sock.sendMessage(jid, { text: PRECOS })
-            continue
-          }
-
-          if (lowerSemAcento === '2' || lowerSemAcento === '2️⃣' || ehHorario(txt)) {
-            await sock.sendMessage(jid, { text: HORARIOS })
-            continue
-          }
-
-          if (lowerSemAcento === '3' || lowerSemAcento === '3️⃣' || ehAtendente(txt)) {
-            await sock.sendMessage(jid, { text: '👤 *Falar com atendente*\n\nEnvie sua mensagem por texto ou áudio. Não atendemos chamadas por este número.' })
-            continue
-          }
-
-          const precoEspecifico = respostaPreco(txt)
-          if (precoEspecifico) {
-            await sock.sendMessage(jid, { text: precoEspecifico })
-            continue
-          }
-
-          if (ehPerguntaDesconhecida(txt)) {
-            await sock.sendMessage(jid, { text: '⚠️ Esse serviço ou preço ainda não está cadastrado no sistema.\n\nDigite *1* para consultar os preços ou descreva o serviço que procura.' })
-            continue
-          }
-        }
-
-        const gatilho =
-          lowerSemAcento.includes('criar curriculum') ||
-          lowerSemAcento.includes('criar curriculo') ||
-          (lowerSemAcento.includes('criar') && lowerSemAcento.includes('curric')) ||
-          lowerSemAcento === 'curriculo' ||
-          lowerSemAcento === 'curriculum'
-
-        if (gatilho) {
-          sessions.set(jid, novoCadastro())
-          await sock.sendMessage(jid, { text: mensagemDaEtapa('nome', sessions.get(jid)) })
-          continue
-        }
-
-        const s = getSession(jid)
-        if (s.step === 'idle') continue
-        const d = s.data
-
-        try {
-          if (s.step === 'nome') {
-            const v = validarNome(txt)
-            if (!v.ok) {
-              await sock.sendMessage(jid, { text: `⚠️ ${v.erro}\nExemplo: João da Silva` })
-              continue
-            }
-            d.nome = v.valor
-            pushStep(s, 'nascimento')
-            await sock.sendMessage(jid, { text: mensagemDaEtapa('nascimento', s) })
-          }
-
-          else if (s.step === 'nascimento') {
-            const v = validarDataNascimento(txt)
-            if (!v.ok) {
-              await sock.sendMessage(jid, { text: `⚠️ ${v.erro}\n\nAceito:\n• DD/MM/AAAA — 15/03/1983\n• MM/AAAA — 03/1983\n• AAAA — 1983` })
-              continue
-            }
-            d.dataNascimento = v.valor
-            d.idade = v.idade
-            pushStep(s, 'nacionalidade')
-            await sock.sendMessage(jid, { text: mensagemDaEtapa('nacionalidade', s) })
-          }
-
-          else if (s.step === 'nacionalidade') {
-            d.nacionalidade = txt
-            pushStep(s, 'estadoCivil')
-            await sock.sendMessage(jid, { text: mensagemDaEtapa('estadoCivil', s) })
-          }
-
-          else if (s.step === 'estadoCivil') {
-            const v = validarEstadoCivil(txt)
-            if (!v.ok) {
-              await sock.sendMessage(jid, { text: '⚠️ Estado civil não reconhecido.\n\nDigite, por exemplo: solteiro, casado, divorciado, viúvo, separado ou união estável.' })
-              continue
-            }
-            d.estadoCivil = v.valor
-            pushStep(s, 'rua')
-            await sock.sendMessage(jid, { text: mensagemDaEtapa('rua', s) })
-          }
-
-          else if (s.step === 'rua') {
-            d.rua = txt
-            pushStep(s, 'numero')
-            await sock.sendMessage(jid, { text: mensagemDaEtapa('numero', s) })
-          }
-
-          else if (s.step === 'numero') {
-            d.numero = txt
-            pushStep(s, 'complemento')
-            await sock.sendMessage(jid, { text: mensagemDaEtapa('complemento', s) })
-          }
-
-          else if (s.step === 'complemento') {
-            d.complemento = opcional(txt) ? '' : txt
-            pushStep(s, 'bairro')
-            await sock.sendMessage(jid, { text: mensagemDaEtapa('bairro', s) })
-          }
-
-          else if (s.step === 'bairro') {
-            d.bairro = txt
-            pushStep(s, 'cidade')
-            await sock.sendMessage(jid, { text: mensagemDaEtapa('cidade', s) })
-          }
-
-          else if (s.step === 'cidade') {
-            d.cidade = txt
-            pushStep(s, 'estado')
-            await sock.sendMessage(jid, { text: mensagemDaEtapa('estado', s) })
-          }
-
-          else if (s.step === 'estado') {
-            if (!/^[A-Za-z]{2}$/.test(txt)) {
-              await sock.sendMessage(jid, { text: '⚠️ Digite a sigla do estado com 2 letras.\nExemplo: SP' })
-              continue
-            }
-            d.estado = txt.toUpperCase()
-            pushStep(s, 'cep')
-            await sock.sendMessage(jid, { text: mensagemDaEtapa('cep', s) })
-          }
-
-          else if (s.step === 'cep') {
-            const cepFormatado = formatarCEP(txt)
-            if (!validarCEP(cepFormatado)) {
-              await sock.sendMessage(jid, { text: '⚠️ CEP inválido.\nExemplo: 08500-000 ou 08500000' })
-              continue
-            }
-            d.cep = cepFormatado
-            pushStep(s, 'telefone')
-            await sock.sendMessage(jid, { text: mensagemDaEtapa('telefone', s) })
-          }
-
-          else if (s.step === 'telefone') {
-            let telFormatado = txt
-            const fmt = formatarTelefone(txt)
-            if (fmt) telFormatado = fmt
-            if (!validarTelefoneFormatado(telFormatado)) {
-              await sock.sendMessage(jid, { text: '⚠️ Telefone inválido.\nExemplo: (11) 94204-7248 ou 11942047248' })
-              continue
-            }
-            d.telefone = telFormatado
-            pushStep(s, 'email')
-            await sock.sendMessage(jid, { text: mensagemDaEtapa('email', s) })
-          }
-
-          else if (s.step === 'email') {
-            const email = txt.toLowerCase()
-            if (!validarEmail(email)) {
-              await sock.sendMessage(jid, { text: '⚠️ E-mail inválido.\nExemplo: joao@gmail.com' })
-              continue
-            }
-            d.email = email
-            pushStep(s, 'objetivo')
-            await sock.sendMessage(jid, { text: mensagemDaEtapa('objetivo', s) })
-          }
-
-          else if (s.step === 'objetivo') {
-            d.objetivo = txt
-            pushStep(s, 'exp_empresa')
-            await sock.sendMessage(jid, { text: mensagemDaEtapa('exp_empresa', s) })
-          }
-
-          else if (s.step === 'exp_empresa') {
-            if (lowerSemAcento.includes('primeiro')) {
-              d.experiencias = []
-              pushStep(s, 'formacao')
-              await sock.sendMessage(jid, { text: mensagemDaEtapa('formacao', s) })
-              continue
-            }
-            s.expTemp = { empresa: txt }
-            pushStep(s, 'exp_cargo')
-            await sock.sendMessage(jid, { text: `Cargo na *${txt}*?` })
-          }
-
-          else if (s.step === 'exp_cargo') {
-            s.expTemp.cargo = txt
-            pushStep(s, 'exp_inicio')
-            await sock.sendMessage(jid, { text: mensagemDaEtapa('exp_inicio', s) })
-          }
-
-          else if (s.step === 'exp_inicio') {
-            const v = validarDataExp(txt, false)
-            if (!v.ok) {
-              await sock.sendMessage(jid, { text: `⚠️ ${v.erro}\nUse DD/MM/AAAA, MM/AAAA ou AAAA.` })
-              continue
-            }
-            s.expTemp.inicio = v.valor
-            s.expTemp.inicioData = v.data
-            pushStep(s, 'exp_fim')
-            await sock.sendMessage(jid, { text: mensagemDaEtapa('exp_fim', s) })
-          }
-
-          else if (s.step === 'exp_fim') {
-            const v = validarDataExp(txt, true)
-            if (!v.ok) {
-              await sock.sendMessage(jid, { text: `⚠️ ${v.erro}\nUse DD/MM/AAAA, MM/AAAA, AAAA ou *atual*.` })
-              continue
-            }
-            if (!compararDatasInicioFim({ data: s.expTemp.inicioData }, v)) {
-              await sock.sendMessage(jid, { text: '⚠️ A data de saída não pode ser anterior à data de início. Tente novamente.' })
-              continue
-            }
-            s.expTemp.fim = v.valor
-            delete s.expTemp.inicioData
-            d.experiencias.push({ ...s.expTemp })
-            s.expTemp = {}
-            pushStep(s, 'exp_mais')
-            await sock.sendMessage(jid, { text: `✅ Empresa adicionada!\n\nTem mais empresas? Responda *sim* ou *não*.` })
-          }
-
-          else if (s.step === 'exp_mais') {
-            if (lowerSemAcento.startsWith('s')) {
-              pushStep(s, 'exp_empresa')
-              await sock.sendMessage(jid, { text: '🏢 Nome da próxima empresa?' })
-            } else if (lowerSemAcento.startsWith('n')) {
-              pushStep(s, 'formacao')
-              await sock.sendMessage(jid, { text: mensagemDaEtapa('formacao', s) })
-            } else {
-              await sock.sendMessage(jid, { text: 'Responda somente *sim* ou *não*.' })
-            }
-          }
-
-          else if (s.step === 'formacao') {
-            d.formacao = txt
-            pushStep(s, 'curso_pergunta')
-            await sock.sendMessage(jid, { text: mensagemDaEtapa('curso_pergunta', s) })
-          }
-
-          else if (s.step === 'curso_pergunta') {
-            if (lowerSemAcento.startsWith('s')) {
-              pushStep(s, 'curso_nome')
-              await sock.sendMessage(jid, { text: '📚 Nome do curso?' })
-            } else if (lowerSemAcento.startsWith('n')) {
-              pushStep(s, 'habilidades')
-              await sock.sendMessage(jid, { text: mensagemDaEtapa('habilidades', s) })
-            } else {
-              await sock.sendMessage(jid, { text: 'Responda somente *sim* ou *não*.' })
-            }
-          }
-
-          else if (s.step === 'curso_nome') {
-            s.cursoTemp = { nome: txt }
-            pushStep(s, 'curso_inst')
-            await sock.sendMessage(jid, { text: `🏫 Onde fez *${txt}*?\n\nSe não lembrar ou não quiser informar, digite *não informado*.` })
-          }
-
-          else if (s.step === 'curso_inst') {
-            s.cursoTemp.instituicao = opcional(txt) ? 'Não informado' : txt
-            pushStep(s, 'curso_ano')
-            await sock.sendMessage(jid, { text: '📅 Ano do curso?\nEx: 2023\nSe não lembrar, digite *não lembro*.' })
-          }
-
-          else if (s.step === 'curso_ano') {
-            if (opcional(txt)) {
-              s.cursoTemp.ano = 'Não informado'
-            } else {
-              const v = validarAno(txt)
-              if (!v.ok) {
-                await sock.sendMessage(jid, { text: `⚠️ ${v.erro}\nOu digite *não lembro*.` })
-                continue
-              }
-              s.cursoTemp.ano = v.valor
-            }
-            d.cursos.push({ ...s.cursoTemp })
-            s.cursoTemp = {}
-            pushStep(s, 'curso_mais')
-            await sock.sendMessage(jid, { text: '✅ Curso adicionado!\n\nTem mais cursos? *sim* ou *não*.' })
-          }
-
-          else if (s.step === 'curso_mais') {
-            if (lowerSemAcento.startsWith('s')) {
-              pushStep(s, 'curso_nome')
-              await sock.sendMessage(jid, { text: '📚 Nome do próximo curso?' })
-            } else if (lowerSemAcento.startsWith('n')) {
-              pushStep(s, 'habilidades')
-              await sock.sendMessage(jid, { text: mensagemDaEtapa('habilidades', s) })
-            } else {
-              await sock.sendMessage(jid, { text: 'Responda somente *sim* ou *não*.' })
-            }
-          }
-
-          else if (s.step === 'habilidades') {
-            d.habilidades = opcional(txt) ? '' : txt
-            pushStep(s, 'resumo')
-            await sock.sendMessage(jid, { text: mensagemDaEtapa('resumo', s) })
-          }
-
-          else if (s.step === 'resumo') {
-            d.resumo = opcional(txt) ? '' : txt
-            await finalizarCurriculo(jid, d, s, sock)
-          }
-        } catch (e) {
-          log('Erro ao processar atendimento (dados da conversa omitidos)')
-          await sock.sendMessage(jid, { text: '⚠️ Ocorreu um erro ao processar sua resposta. Tente novamente.' }).catch(() => {})
-        }
-      }
-    })
-  } finally {
-    if (!sockAtual) starting = false
-  }
-
-  return sock
-}
-
-function mensagemDaEtapa(step) {
-  const mensagens = {
-    nome: '👋 Olá! Sou o Robô da Conexão v7cyber 🤖\n\nVamos montar seu currículo profissional!\n\n💡 A qualquer momento digite *voltar*, *sair* ou *cancelar*.\n\n1️⃣ Qual seu nome e sobrenome completo?\nEx: João da Silva',
-    nascimento: '2️⃣ Data de nascimento?\n\nAceito:\n• DD/MM/AAAA — Ex: 15/03/1983\n• MM/AAAA — Ex: 03/1983\n• AAAA — Ex: 1983',
-    nacionalidade: '3️⃣ Nacionalidade?\nEx: Brasileiro',
-    estadoCivil: '4️⃣ Estado civil?\nEx: Solteiro, Casado, Divorciado, Viúvo ou União Estável',
-    rua: '5️⃣ Nome da RUA / Avenida?\nEx: Rua das Flores',
-    numero: '6️⃣ NÚMERO da casa?\nEx: 123',
-    complemento: '7️⃣ COMPLEMENTO?\nEx: Apto 101, Bloco B\nSe não tiver, digite *não*',
-    bairro: '8️⃣ BAIRRO?\nEx: Centro',
-    cidade: '9️⃣ CIDADE?\nEx: São Paulo',
-    estado: '🔟 ESTADO (sigla 2 letras)?\nEx: SP, RJ, MG',
-    cep: '1️⃣1️⃣ CEP?\nFormato: 00000-000\nPode digitar só números também: 08500000',
-    telefone: '1️⃣2️⃣ TELEFONE / WhatsApp?\nEx: (11) 94204-7248\nPode digitar só números: 11942047248',
-    email: '1️⃣3️⃣ E-MAIL?\nEx: joao@gmail.com',
-    objetivo: '1️⃣4️⃣ OBJETIVO PROFISSIONAL?\nEx: Auxiliar administrativo, Vendedor, Motorista',
-    exp_empresa: '1️⃣5️⃣ Nome da empresa?\nSe for seu primeiro emprego, digite *primeiro emprego*.',
-    exp_inicio: '📅 Data de INÍCIO?\nAceito: DD/MM/AAAA, MM/AAAA ou AAAA.\nEx: 15/03/2022, 03/2022 ou 2022',
-    exp_fim: '📅 Data de SAÍDA?\nAceito: DD/MM/AAAA, MM/AAAA ou AAAA.\nSe ainda trabalha lá, digite *atual*.',
-    formacao: '🎓 Qual sua formação?\nEx: Ensino médio completo, Superior em Administração',
-    curso_pergunta: '📚 Tem cursos? Responda *sim* ou *não*.',
-    habilidades: '💡 HABILIDADES — Opcional\n\nDigite suas habilidades ou *pular* para não incluir.\nEx: Informática, Atendimento ao cliente, Pacote Office, CNH B',
-    resumo: '📝 RESUMO PROFISSIONAL — Opcional\n\nDigite seu resumo ou *pular* para não incluir.'
-  }
-  return mensagens[step] || 'Continue o preenchimento.'
-}
-
-async function finalizarCurriculo(jid, d, s, sock) {
-  const exps = d.experiencias.map((e, i) =>
-    `${i + 1}. ${e.empresa.toUpperCase()}\nCargo: ${e.cargo}\nPeríodo: ${e.inicio} até ${e.fim}`
-  ).join('\n\n') || 'Primeiro emprego'
-
-  const cursos = d.cursos.map((c, i) =>
-    `${i + 1}. ${c.nome}\nInstituição: ${c.instituicao}\nAno: ${c.ano}`
-  ).join('\n\n') || 'Nenhum'
-
-  const enderecoCompleto = `${d.rua}, ${d.numero}${d.complemento ? ' - ' + d.complemento : ''} - ${d.bairro} - ${d.cidade}/${d.estado} - CEP ${d.cep}`
-
-  const textoModelo = `🔔 *NOVO CURRÍCULO - Conexão v7cyber*
+// ======================================================
+// CURRÍCULO FINAL
+// ======================================================
+function montarCurriculo(jid, d) {
+  const exps = d.experiencias.map((e,i) =>
+`${i+1}. ${e.empresa.toUpperCase()}
+Cargo: ${e.cargo}
+Período: ${e.inicio} até ${e.fim}`
+  ).join('\n\n') || 'Primeiro emprego';
+
+  const cursos = d.cursos.map((c,i) =>
+`${i+1}. ${c.nome} - ${c.instituicao} (${c.ano})`
+  ).join('\n') || 'Nenhum';
+
+  const endereco =
+`${d.rua}, ${d.numero}${d.complemento ? ' - ' + d.complemento : ''}
+- ${d.bairro} - ${d.cidade}/${d.estado}
+- CEP ${d.cep}`;
+
+  return `🔔 *NOVO CURRÍCULO - Conexão v7cyber*
 
 *👤 DADOS PESSOAIS*
+
 *Nome:* ${d.nome}
-*Nascimento:* ${d.dataNascimento} (${d.idade} anos)
+*Nascimento:* ${d.dataNascimento}
 *Nacionalidade:* ${d.nacionalidade}
 *Estado Civil:* ${d.estadoCivil}
-*Endereço:* ${enderecoCompleto}
+*Idade:* ${d.idade} anos
+
+*Endereço:* ${endereco}
 *Telefone:* ${d.telefone}
 *Email:* ${d.email}
 
@@ -882,140 +281,1339 @@ ${d.habilidades || 'Não informado'}
 ${d.resumo || 'Não informado'}
 
 -------------------------
+
 📱 Candidato: ${jid}
 🤖 Conexão v7cyber
 
 *✉️ CARTA DE APRESENTAÇÃO*
 
-Prezados(as),
+Prezados,
 
-Meu nome é ${d.nome}, ${d.idade} anos, ${d.nacionalidade}, ${d.estadoCivil}.
+Meu nome é ${d.nome}, nascido em ${d.dataNascimento}, ${d.nacionalidade}, ${d.idade} anos, email ${d.email}.
+
+Moro em ${endereco}.
+
 Meu objetivo é atuar como ${d.objetivo}.
+
 ${d.experiencias[0]
-    ? `Possuo experiência como ${d.experiencias[0].cargo} na ${d.experiencias[0].empresa.toUpperCase()}.`
-    : 'Estou em busca da minha primeira oportunidade profissional.'}
-Formação: ${d.formacao}.
-${d.habilidades ? `Tenho como habilidades: ${d.habilidades}.` : ''}
-${d.resumo ? `${d.resumo}` : ''}
-Coloco-me à disposição para uma entrevista.
+  ? `Experiência como ${d.experiencias[0].cargo} na ${d.experiencias[0].empresa.toUpperCase()}.`
+  : 'Em busca do primeiro emprego.'}
+
+Formação: ${d.formacao}
+
+Telefone: ${d.telefone} | Email: ${d.email}
+
+${d.habilidades ? `Habilidades: ${d.habilidades}` : ''}
+${d.resumo ? `Resumo: ${d.resumo}` : ''}
 
 Atenciosamente,
-${d.nome}
-`
 
-  const nomeSeguro = d.nome.replace(/[^A-Za-zÀ-ÖØ-öø-ÿ0-9 _-]/g, '').replace(/\s+/g, '_')
-  const nomeArquivo = `CURRICULO-${nomeSeguro}.txt`
-  const caminhoArquivo = path.join(__dirname, nomeArquivo)
+${d.nome}`;
+}
 
-  try {
-    fs.writeFileSync(caminhoArquivo, textoModelo, 'utf8')
-    log('Arquivo temporário de currículo criado')
-  } catch (e) {
-    log('Erro ao criar arquivo temporário de currículo')
+// ======================================================
+// MENU INICIAL E INFORMAÇÕES DO ATENDIMENTO
+// ======================================================
+
+function menuPrincipal() {
+  return `👋 Olá! Seja bem-vindo à *v7cyber* 🤖
+
+*Como podemos ajudar?*
+
+1️⃣ Horário de Funcionamento
+2️⃣ Localização
+3️⃣ Tabela de Preços
+4️⃣ Criar Contrato de Locação
+5️⃣ Criar Currículo
+6️⃣ Chave Pix
+7️⃣ Solicitar meu currículo em PDF
+
+Digite *1, 2, 3, 4, 5, 6 ou 7* para escolher.
+Durante a conversa, digite *menu* para ver estas opções novamente.`;
+}
+
+function respostaMenu(opcao) {
+  switch (opcao) {
+    case '1':
+      return `🕐 *HORÁRIO DE ATENDIMENTO*
+
+📍 Rua Três Américas, 403 — Mauá/SP
+
+🗓️ Segunda a sexta: *10h às 17h*
+🗓️ Sábado: *10h às 13h*
+🍽️ Não fechamos para almoço.
+
+Digite *menu* para voltar às opções.`;
+
+    case '2':
+      return `📍 *LOCALIZAÇÃO*
+
+*v7cyber*
+Rua Três Américas, 403
+Mauá — SP
+
+Digite *menu* para voltar às opções.`;
+
+    case '3':
+      return `💰 *TABELA DE PREÇOS*
+📍 Rua Três Américas, 403 — Mauá/SP
+
+🖨️ *XEROX E IMPRESSÃO*
+Xerox P&B — *R$ 0,85*
+Xerox colorida — *R$ 1,00*
+Impressão P&B — *R$ 1,50*
+Frente e verso — *R$ 1,15*
+
+📄 *SCANNER*
+Até 3 folhas — *R$ 2,00*
+Até 8 folhas — *R$ 5,00*
+Acima de 8 folhas — *R$ 8,00*
+📲 Envio pelo WhatsApp incluso.
+
+📋 *CURRÍCULO*
+Currículo — *R$ 8,00*
+⏱️ Prazo: até 2 horas
+✅ Primeiro emprego e Jovem Aprendiz
+
+💻 *SERVIÇOS DIGITAIS*
+Segunda via de contas — *R$ 5,00*
+Consulta na internet — *R$ 3,00*
+Impressão de consulta — *+R$ 1,00 por folha*
+Boletim de Ocorrência — *R$ 7,00*
+Abertura de MEI — *R$ 10,00*
+Nota Fiscal NFS-e — *R$ 5,00*
+
+📱 *CADASTROS E SERVIÇOS*
+Gov.br — *R$ 5,00*
+Meu INSS — *R$ 5,00*
+CNIS — *R$ 5,00*
+CNH Digital — *R$ 5,00*
+Carteira de Trabalho Digital — *R$ 5,00*
+Agendamento Poupatempo — *R$ 5,00*
+Outros Cadastros e Agendamentos — *R$ 5,00*
+
+💳 *PAGAMENTO*
+Pix • Dinheiro • Cartão
+
+❌ *NÃO FAZEMOS*
+Plastificação
+Foto 3x4
+Encadernação
+Entregas
+
+Digite *menu* para voltar às opções.`;
+
+    case '6':
+      return `💳 *CHAVE PIX*
+
+🔑 *Chave:* 12123718000154
+👤 *Titular:* Jefferson Alessandro Rossi
+🏦 *Banco:* Nubank
+
+Digite *menu* para voltar às opções.`;
+
+    default:
+      return null;
   }
+}
+function respostaSimNao(txt) {
+  const lower = txt.toLowerCase().trim();
 
-  try {
-    log('Enviando currículo para destino configurado')
-    await sock.sendMessage(DESTINO_CURRICULOS, { text: textoModelo })
+  if (['1', 'sim', 's', 'yes'].includes(lower))
+    return 'sim';
 
-    if (fs.existsSync(caminhoArquivo)) {
-      await new Promise(r => setTimeout(r, 800))
-      await sock.sendMessage(DESTINO_CURRICULOS, {
-        document: fs.readFileSync(caminhoArquivo),
-        mimetype: 'text/plain',
-        fileName: nomeArquivo
-      })
+  if (['2', 'não', 'nao', 'n', 'no'].includes(lower))
+    return 'nao';
+
+  if (['3', 'pular', 'skip'].includes(lower))
+    return 'pular';
+
+  return null;
+}
+
+// ======================================================
+// CADASTRO SIMPLIFICADO DE CONTRATO DE LOCAÇÃO
+// Coleta os dados em etapas e envia o resumo ao administrador.
+// ======================================================
+function perguntasContrato(d, somenteChaves = null) {
+  const a = d.contratoRespostas || {};
+  const q = [
+    ['locador_nome','*LOCADOR* — Nome completo:','nome'],
+    ['locador_nascimento','*LOCADOR* — Data de nascimento (DD/MM/AAAA):','data'],
+    ['locador_endereco','*LOCADOR* — Endereço residencial (rua/avenida):','texto'],
+    ['locador_numero','*LOCADOR* — Número da casa/apartamento:','texto'],
+    ['locador_complemento','*LOCADOR* — Complemento (ou digite *pular* se não houver):','opcional'],
+    ['locador_bairro','*LOCADOR* — Bairro:','texto'], ['locador_cidade','*LOCADOR* — Cidade:','texto'], ['locador_estado','*LOCADOR* — Estado (sigla com 2 letras, ex.: SP):','uf'], ['locador_cep','*LOCADOR* — CEP:','cep'],
+    ['locador_estadoCivil','*LOCADOR* — Estado civil? Solteiro, casado, divorciado, viúvo, separado ou união estável.','estadoCivil'],
+    ['locador_rg','*LOCADOR* — RG:','rg'], ['locador_cpf','*LOCADOR* — CPF:','cpf'],
+    ['locador_nacionalidade','*LOCADOR* — Nacionalidade:','texto'],
+    ['locador_email','*LOCADOR* — E-mail:','email'], ['locador_telefone','*LOCADOR* — Telefone com DDD:','telefone'],
+    ['outroLocador',`*Há outro locador?*\n\n*1.* Sim\n*2.* Não`,'simNao'],
+    ['locador2_conjuge',`*O segundo locador é cônjuge do primeiro locador?*\n\n*1.* Sim\n*2.* Não`,'simNao'],
+    ['locador2_nome','*SEGUNDO LOCADOR* — Nome completo:','nome'], ['locador2_cpf','*SEGUNDO LOCADOR* — CPF:','cpf'], ['locador2_rg','*SEGUNDO LOCADOR* — RG:','rg'], ['locador2_nascimento','*SEGUNDO LOCADOR* — Data de nascimento (DD/MM/AAAA):','data'], ['locador2_estadoCivil','*SEGUNDO LOCADOR* — Estado civil:','estadoCivil'], ['locador2_nacionalidade','*SEGUNDO LOCADOR* — Nacionalidade:','texto'], ['locador2_endereco','*SEGUNDO LOCADOR* — Endereço completo:','texto'], ['locador2_telefone','*SEGUNDO LOCADOR* — Telefone com DDD:','telefone'], ['locador2_email','*SEGUNDO LOCADOR* — E-mail (ou digite pular):','emailOpcional'],
+    ['enderecoImovelIgualLocatario',`*O endereço do imóvel que será alugado é o mesmo endereço residencial do locatário?*\n\n*1.* Sim\n*2.* Não`,'simNao'],
+    ['locatario_nome','*LOCATÁRIO* — Nome completo:','nome'],
+    ['locatario_nascimento','*LOCATÁRIO* — Data de nascimento (DD/MM/AAAA):','data'],
+    ['locatario_endereco','*LOCATÁRIO* — Endereço residencial (rua/avenida):','texto'],
+    ['locatario_numero','*LOCATÁRIO* — Número da casa/apartamento:','texto'],
+    ['locatario_complemento','*LOCATÁRIO* — Complemento (ou digite *pular* se não houver):','opcional'],
+    ['locatario_bairro','*LOCATÁRIO* — Bairro:','texto'], ['locatario_cidade','*LOCATÁRIO* — Cidade:','texto'], ['locatario_estado','*LOCATÁRIO* — Estado (sigla com 2 letras, ex.: SP):','uf'], ['locatario_cep','*LOCATÁRIO* — CEP:','cep'],
+    ['locatario_estadoCivil','*LOCATÁRIO* — Estado civil? Solteiro, casado, divorciado, viúvo, separado ou união estável.','estadoCivil'],
+    ['locatario_rg','*LOCATÁRIO* — RG:','rg'], ['locatario_cpf','*LOCATÁRIO* — CPF:','cpf'],
+    ['locatario_nacionalidade','*LOCATÁRIO* — Nacionalidade:','texto'],
+    ['locatario_email','*LOCATÁRIO* — E-mail:','email'], ['locatario_telefone','*LOCATÁRIO* — Telefone com DDD:','telefone'],
+    ['outroLocatario',`*Há outro locatário?*\n\n*1.* Sim\n*2.* Não`,'simNao'],
+    ['locatario2_conjuge',`*O segundo locatário é cônjuge do primeiro locatário?*\n\n*1.* Sim\n*2.* Não`,'simNao'],
+    ['locatario2_nome','*SEGUNDO LOCATÁRIO* — Nome completo:','nome'], ['locatario2_cpf','*SEGUNDO LOCATÁRIO* — CPF:','cpf'], ['locatario2_rg','*SEGUNDO LOCATÁRIO* — RG:','rg'], ['locatario2_nascimento','*SEGUNDO LOCATÁRIO* — Data de nascimento (DD/MM/AAAA):','data'], ['locatario2_estadoCivil','*SEGUNDO LOCATÁRIO* — Estado civil:','estadoCivil'], ['locatario2_nacionalidade','*SEGUNDO LOCATÁRIO* — Nacionalidade:','texto'], ['locatario2_endereco','*SEGUNDO LOCATÁRIO* — Endereço completo:','texto'], ['locatario2_telefone','*SEGUNDO LOCATÁRIO* — Telefone com DDD:','telefone'], ['locatario2_email','*SEGUNDO LOCATÁRIO* — E-mail (ou digite pular):','emailOpcional'],
+    ['tipoImovel','Tipo do imóvel: 1 Casa, 2 Apartamento ou 3 Outro.','tipoImovel'],
+    ['garagem','*O imóvel possui garagem?*\n\n*1.* Sim\n*2.* Não.','simNao'],
+    ['enderecoImovel','Endereço do imóvel — rua/avenida:','texto'],
+    ['numeroImovel','Número do imóvel:','texto'],
+    ['complementoImovel','Complemento do imóvel (ou digite *pular* se não houver):','opcional'],
+    ['bairroImovel','Bairro do imóvel:','texto'], ['cidadeImovel','Cidade do imóvel:','texto'], ['estadoImovel','Estado do imóvel (sigla com 2 letras, ex.: SP):','uf'],
+    ['cepImovel','CEP do imóvel:','cep'],
+    ['finalidade','Finalidade da locação: 1 Residencial ou 2 Comercial.','finalidade'],
+    ['mobiliado','*O imóvel é mobiliado?*\n\n*1.* Sim\n*2.* Não\n*3.* Parcialmente.','mobiliado'],
+    ['descricaoMoveis','Descreva os móveis e itens existentes:','texto'],
+    ['prazo','Prazo da locação em meses (número inteiro maior que zero):','positivo'],
+    ['dataInicio','Data de início da locação (DD/MM/AAAA):','data'],
+    ['aluguel','Valor mensal do aluguel (ex.: R$ 1.200,00):','dinheiro'],
+    ['vencimento','Dia de vencimento mensal (1 a 31):','vencimento'],
+    ['pagamento','Forma de pagamento: 1 Pix ou 2 transferência/depósito bancário.','formaPagamento'],
+    ['pix','Informe a chave Pix para pagamento:','texto'],
+    ['banco','Nome do banco:','texto'], ['agencia','Agência bancária:','texto'],
+    ['conta','Número da conta e tipo (corrente/poupança):','texto'],
+    ['titularConta','Nome do titular da conta:','texto'],
+    ['garantia','Garantia: 1 Nenhuma, 2 Caução, 3 Fiador ou 4 Seguro-fiança.','garantia'],
+    ['caucaoValor','Valor da caução em reais:','dinheiro'],
+    ['caucaoData','Data de pagamento da caução (DD/MM/AAAA):','data'],
+    ['caucaoDestino',`Como deseja que a caução seja tratada ao término da locação?\n\n*1.* Devolução integral ao locatário, desde que não existam débitos ou danos ao imóvel.\n\n*2.* Devolução do valor restante após o desconto de eventuais débitos, danos ou outras obrigações previstas no contrato.\n\n*3.* Outra forma de devolução, conforme acordado entre locador e locatário.`,'caucaoDestino'],
+    ['caucaoOutraForma','Descreva qual é a outra forma de devolução da caução:','texto'],
+    ['fiador_nome','FIADOR — Nome completo:','nome'], ['fiador_cpf','FIADOR — CPF:','cpf'],
+    ['fiador_rg','FIADOR — RG:','rg'], ['fiador_endereco','FIADOR — Endereço completo, incluindo número:','texto'],
+    ['fiador_telefone','FIADOR — Telefone com DDD:','telefone'],
+    ['seguroDados','Seguro-fiança — seguradora e dados disponíveis:','texto'],
+    ['condicoes','Selecione restrições/condições por número, separados por vírgula; 0 para nenhuma.','condicoes'],
+    ['outraCondicao','Descreva a condição adicional:','texto']
+  ];
+  return q.filter(([key]) => {
+    if (['locador_complemento','locatario_complemento','complementoImovel'].includes(key)) return true;
+    if (key === 'enderecoImovelIgualLocatario') return true;
+    if (['enderecoImovel','numeroImovel','complementoImovel','bairroImovel','cidadeImovel','estadoImovel','cepImovel'].includes(key) && /^1$|^sim$/i.test(a.enderecoImovelIgualLocatario || '')) return false;
+    if (key === 'outroLocador') return true;
+    if (key === 'locador2_conjuge') return /^(1|sim|s)$/i.test(String(a.outroLocador || ''));
+    if (key.startsWith('locador2_')) {
+      if (!/^(1|sim|s)$/i.test(String(a.outroLocador || ''))) return false;
+      if (/^(locador2_nascimento|locador2_estadoCivil|locador2_nacionalidade|locador2_endereco|locador2_telefone|locador2_email)$/.test(key) && /^(1|sim|s)$/i.test(String(a.locador2_conjuge || ''))) return false;
+      return true;
     }
-    log('✅ Currículo enviado ao destino')
-  } catch (e) {
-    log('❌ Erro ao enviar currículo')
-  } finally {
-    try { if (fs.existsSync(caminhoArquivo)) fs.unlinkSync(caminhoArquivo) } catch (e) {}
+    if (key === 'enderecoImovelIgualLocatario') return true;
+    if (key === 'outroLocatario') return true;
+    if (key === 'locatario2_conjuge') return /^(1|sim|s)$/i.test(String(a.outroLocatario || ''));
+    if (key.startsWith('locatario2_')) {
+      if (!/^(1|sim|s)$/i.test(String(a.outroLocatario || ''))) return false;
+      if (/^(locatario2_nascimento|locatario2_estadoCivil|locatario2_nacionalidade|locatario2_endereco|locatario2_telefone|locatario2_email)$/.test(key) && /^(1|sim|s)$/i.test(String(a.locatario2_conjuge || ''))) return false;
+      return true;
+    }
+    if (key.startsWith('locatario_')) return true;
+    if (key === 'fiador_nome' || key === 'fiador_cpf' || key === 'fiador_rg' || key === 'fiador_endereco' || key === 'fiador_telefone') return /fiador/i.test(a.garantia || '');
+    if (key === 'seguroDados') return /seguro/i.test(a.garantia || '');
+    if (['caucaoValor','caucaoData','caucaoDestino','caucaoOutraForma'].includes(key)) return /^2$|cau[cç][aã]o/i.test(a.garantia || '') && (key !== 'caucaoOutraForma' || String(a.caucaoDestino || '') === '3' || /Outra forma/i.test(a.caucaoDestino || ''));
+    if (key === 'pix') return /^1$|pix/i.test(a.pagamento || '');
+    if (['banco','agencia','conta','titularConta'].includes(key)) return /^2$|banco|transfer|dep[oó]sito/i.test(a.pagamento || '');
+    if (key === 'descricaoMoveis') return /^(1|3)$|sim|parcial/i.test(a.mobiliado || '');
+    if (key === 'outraCondicao') return Array.isArray(a.condicoes) && a.condicoes.includes('Outra condição');
+    return true;
+  }).filter(([key]) => !Array.isArray(somenteChaves) || somenteChaves.includes(key)).map(([key, pergunta, tipo]) => {
+    if (key === 'condicoes') return [key, pergunta + '\n1 Pets/animais\n2 Som alto e perturbação do sossego\n3 Mudanças e movimentação de móveis\n4 Uso de áreas comuns\n5 Reformas/alterações\n6 Proibição de sublocação sem autorização\n7 Outra condição', tipo];
+    return [key, pergunta, tipo];
+  });
+}
+
+function validarCPFContrato(txt) {
+  const cpf = String(txt).replace(/\D/g, '');
+  if (cpf.length !== 11 || /^(\d)\1{10}$/.test(cpf)) return false;
+  let soma = 0;
+  for (let i = 0; i < 9; i++) soma += Number(cpf[i]) * (10 - i);
+  let dig = (soma * 10) % 11;
+  if (dig === 10) dig = 0;
+  if (dig !== Number(cpf[9])) return false;
+  soma = 0;
+  for (let i = 0; i < 10; i++) soma += Number(cpf[i]) * (11 - i);
+  dig = (soma * 10) % 11;
+  if (dig === 10) dig = 0;
+  return dig === Number(cpf[10]);
+}
+
+function validarRespostaContrato(tipo, txt) {
+  const v = txt.trim();
+  if (!v) return 'Este campo é obrigatório. Digite uma resposta para continuar.';
+  if (/^(pular|skip)$/i.test(v) && ['opcional','emailOpcional'].includes(tipo)) return null;
+  if (tipo === 'opcional' && /^(não|nao|n|nenhum|sem complemento|pular|skip)$/i.test(v)) return null;
+  if (tipo === 'nome' && v.split(/\s+/).length < 2) return 'Informe nome e sobrenome completos. Ex.: João da Silva.';
+  if (tipo === 'estadoCivil' && !validarEstadoCivil(v).ok) return 'Estado civil inválido. Digite solteiro, casado, divorciado, viúvo, separado ou união estável.';
+  if (tipo === 'rg' && v.replace(/\D/g, '').length < 5) return 'RG inválido. Confira o número e tente novamente.';
+  if (tipo === 'cpf' && !validarCPFContrato(v)) return 'CPF inválido. Confira os 11 dígitos e tente novamente.';
+  if (tipo === 'email' && !validarEmail(v)) return 'E-mail inválido. Ex.: nome@email.com';
+  if (tipo === 'emailOpcional' && !/^(pular|skip|não|nao)$/i.test(v) && !validarEmail(v)) return 'E-mail inválido. Digite um e-mail válido ou *pular*.';
+  if (tipo === 'telefone' && !formatarTelefone(v)) return 'Telefone inválido. Informe DDD e número, por exemplo (11) 91234-5678.';
+  if (tipo === 'uf' && !/^[A-Za-z]{2}$/.test(v)) return 'Informe a sigla do estado com exatamente 2 letras. Ex.: SP, RJ ou MG.';
+  if (tipo === 'simNao' && !/^(sim|s|1|não|nao|n|2)$/i.test(v)) return 'Responda 1 para Sim ou 2 para Não.';
+  if (tipo === 'positivo' && (!/^\d+$/.test(v) || Number(v) < 1 || Number(v) > 600)) return 'Digite um número inteiro entre 1 e 600 meses.';
+  if (tipo === 'data') {
+    const m = v.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+    if (!m) return 'Data inválida. Use o formato DD/MM/AAAA.';
+    const [, dd, mm, yyyy] = m; const dt = new Date(Number(yyyy), Number(mm)-1, Number(dd));
+    if (dt.getFullYear() !== Number(yyyy) || dt.getMonth() !== Number(mm)-1 || dt.getDate() !== Number(dd)) return 'Essa data não existe. Confira o dia, mês e ano.';
+  }
+  if (tipo === 'dinheiro' && !/^\s*(R\$\s*)?\d{1,3}(\.\d{3})*(,\d{1,2})?\s*$|^\s*(R\$\s*)?\d+(,\d{1,2})?\s*$/.test(v)) return 'Valor inválido. Exemplo: 1200,00 ou R$ 1.200,00.';
+  if (tipo === 'vencimento' && (!/^\d{1,2}$/.test(v) || Number(v) < 1 || Number(v) > 31)) return 'Digite um dia entre 1 e 31.';
+  if (['tipoImovel','finalidade','mobiliado','formaPagamento','garantia','caucaoDestino'].includes(tipo) && !/^\d+$/.test(v)) return 'Escolha uma opção digitando o número correspondente.';
+  if (tipo === 'tipoImovel' && !['1','2','3'].includes(v)) return 'Digite 1, 2 ou 3.';
+  if (tipo === 'finalidade' && !['1','2'].includes(v)) return 'Digite 1 para Residencial ou 2 para Comercial.';
+  if (tipo === 'mobiliado' && !['1','2','3'].includes(v)) return 'Digite 1, 2 ou 3.';
+  if (tipo === 'formaPagamento' && !['1','2'].includes(v)) return 'Digite 1 para Pix ou 2 para banco.';
+  if (tipo === 'garantia' && !['1','2','3','4'].includes(v)) return 'Digite uma opção de 1 a 4.';
+  if (tipo === 'caucaoDestino' && !['1','2','3'].includes(v)) return 'Digite 1, 2 ou 3, conforme a opção desejada.';
+  if (tipo === 'condicoes' && v !== '0') {
+    const nums = v.split(/[,;\s]+/).filter(Boolean);
+    if (!nums.length || nums.some(n => !/^[1-7]$/.test(n))) return 'Digite números de 1 a 7 separados por vírgula, ou 0 para nenhuma.';
+  }
+  if (tipo === 'cep' && !/^\d{5}-?\d{3}$/.test(v)) return 'CEP inválido. Informe 8 dígitos, por exemplo 09310-000.';
+  return null;
+}
+
+function perguntaContratoNumerada(perguntas, indice) {
+  const item = perguntas[indice];
+  if (!item) return 'Não encontrei a próxima pergunta.';
+  const [key, pergunta] = item;
+  return `*Pergunta ${indice + 1}:*\n${pergunta}`;
+}
+
+function iniciarContrato(jid) {
+  sessions.set(jid, {
+    step: 'contrato', menuExibido: true, menuPendente: false,
+    lastActivityAt: Date.now(), data: { experiencias: [], cursos: [], contratoRespostas: {} },
+    expTemp: {}, cursoTemp: {}, contratoIndex: 0
+  });
+  return '📄 *CONTRATO DE LOCAÇÃO*\nVamos preencher juntos, uma pergunta por vez.\n\n💡 Se uma informação não se aplicar, digite *pular* quando permitido.\n↩️ Digite *voltar* para corrigir a resposta anterior.\n❌ Digite *cancelar* para encerrar.\n\n' + perguntaContratoNumerada(perguntasContrato(sessions.get(jid).data), 0);
+}
+
+function processarContrato(s, txt, jid) {
+  const a = s.data.contratoRespostas || (s.data.contratoRespostas = {});
+
+  // Menu de correção por grupo, sem reiniciar o cadastro.
+  if (s.step === 'contrato_correcao_menu') {
+    const op = txt.trim();
+    const grupos = {
+      '1': ['locador_nome','locador_nascimento','locador_endereco','locador_numero','locador_complemento','locador_bairro','locador_cidade','locador_estado','locador_cep','locador_estadoCivil','locador_rg','locador_cpf','locador_nacionalidade','locador_email','locador_telefone','outroLocador','locador2_conjuge','locador2_nome','locador2_cpf','locador2_rg','locador2_nascimento','locador2_estadoCivil','locador2_nacionalidade','locador2_endereco','locador2_telefone','locador2_email'],
+      '2': ['enderecoImovelIgualLocatario','locatario_nome','locatario_nascimento','locatario_endereco','locatario_numero','locatario_complemento','locatario_bairro','locatario_cidade','locatario_estado','locatario_cep','locatario_estadoCivil','locatario_rg','locatario_cpf','locatario_nacionalidade','locatario_email','locatario_telefone','outroLocatario','locatario2_conjuge','locatario2_nome','locatario2_cpf','locatario2_rg','locatario2_nascimento','locatario2_estadoCivil','locatario2_nacionalidade','locatario2_endereco','locatario2_telefone','locatario2_email'],
+      '3': ['enderecoImovelIgualLocatario','tipoImovel','garagem','enderecoImovel','numeroImovel','complementoImovel','bairroImovel','cidadeImovel','estadoImovel','cepImovel','finalidade','mobiliado','descricaoMoveis','condicoes','outraCondicao'],
+      '4': ['prazo','dataInicio','aluguel','vencimento','pagamento','pix','banco','agencia','conta','titularConta'],
+      '5': ['garantia','caucaoValor','caucaoData','caucaoDestino','caucaoOutraForma','fiador_nome','fiador_cpf','fiador_rg','fiador_endereco','fiador_telefone','seguroDados']
+    };
+    if (!grupos[op]) return ['Escolha de *1 a 5* para selecionar o grupo que deseja corrigir.'];
+    s.contratoCorrecaoChaves = grupos[op];
+    s.step = 'contrato';
+    const qs = perguntasContrato(s.data, s.contratoCorrecaoChaves);
+    s.contratoIndex = 0;
+    if (!qs.length) { s.step = 'contrato_confirmacao'; s.contratoCorrecaoChaves = null; return ['Não há perguntas para corrigir nesse grupo. Escolha *2* para tentar outro grupo ou *1* para confirmar o envio.']; }
+    return [`✏️ *Correção de dados* — responda apenas às perguntas deste grupo. Os demais dados serão preservados.\n\n${perguntaContratoNumerada(qs, 0)}\n\nDigite *voltar* para retornar ou *cancelar* para encerrar.`];
   }
 
-  await sock.sendMessage(jid, {
-    text: `✅ Obrigado, ${d.nome}! Seu currículo foi recebido com sucesso!\n\n📧 E-mail: ${d.email}\n📱 Tel: ${d.telefone}\n\n🚀 Conexão v7cyber agradece seu cadastro!`
-  }).catch(() => {})
+  // Tela final de conferência: o cliente pode confirmar ou escolher um grupo para corrigir.
+  if (s.step === 'contrato_confirmacao') {
+    const escolha = txt.trim().toLowerCase();
+    if (['1', 'sim', 's', 'confirmar'].includes(escolha)) {
+      const registro = { id: crypto.randomUUID(), data: new Date().toLocaleString('pt-BR'), candidato: 'Contrato de locação', jid, texto: s.contratoResumo };
+      adminMessages.push(registro);
+      if (adminMessages.length > 200) adminMessages.shift();
+      sessions.delete(jid);
+      return [`✅ *Dados confirmados com sucesso!*\n\n💰 *Valor do serviço: R$ 10,00*\n\nSua solicitação foi encaminhada para revisão. Você não precisa enviar o resumo pelo WhatsApp.\n\nDigite *menu* para voltar às opções.`, `__CONTRATO_ENVIADO__:${registro.id}`];
+    }
+    if (['2', 'corrigir', 'voltar', 'não', 'nao', 'n'].includes(escolha)) {
+      s.step = 'contrato_correcao_menu';
+      s.contratoCorrecaoChaves = null;
+      return ['✏️ *O que deseja corrigir?*\n\n*1.* Dados do locador\n*2.* Dados do locatário\n*3.* Imóvel e condições\n*4.* Prazo, aluguel e pagamento\n*5.* Garantia (caução, fiador ou seguro)\n\nDigite o número do grupo.'];
+    }
+    if (['3', 'cancelar'].includes(escolha)) {
+      sessions.delete(jid);
+      return ['Cadastro do contrato cancelado. Digite *menu* para voltar às opções.'];
+    }
+    return ['Escolha uma opção: *1* Confirmar e enviar, *2* Corrigir respostas anteriores ou *3* Cancelar.'];
+  }
+  const perguntas = perguntasContrato(s.data, s.contratoCorrecaoChaves);
+  const idx = Number.isInteger(s.contratoIndex) ? s.contratoIndex : 0;
+  const atual = perguntas[idx];
+  if (!atual) return ['Não encontrei a próxima pergunta. Digite *cancelar* e inicie novamente.'];
+  const [key, pergunta, tipo] = atual;
+  if (/^voltar$/i.test(txt.trim())) {
+    if (idx <= 0) return ['Você já está na primeira pergunta.\n\n' + pergunta];
+    s.contratoIndex = idx - 1;
+    const anterior = perguntasContrato(s.data, s.contratoCorrecaoChaves)[s.contratoIndex];
+    return ['↩️ *Voltando à pergunta anterior.*\n\n' + perguntaContratoNumerada(perguntasContrato(s.data, s.contratoCorrecaoChaves), s.contratoIndex) + '\n\n↩️ *voltar* = pergunta anterior | ❌ *cancelar* = encerrar'];
+  }
+  if (key === 'revisao' && /^(não|nao|n)$/i.test(txt.trim())) {
+    sessions.delete(jid);
+    return ['Cadastro do contrato cancelado. Digite *menu* para voltar às opções.'];
+  }
+  if (key === 'revisao' && !/^(sim|s|1)$/i.test(txt.trim())) {
+    return ['Responda *sim* para confirmar ou *não* para cancelar.'];
+  }
+  const erroValidacao = validarRespostaContrato(tipo, txt);
+  if (erroValidacao) return [`⚠️ ${erroValidacao}\n\n${perguntaContratoNumerada(perguntas, idx)}\n\n↩️ *voltar* = pergunta anterior | ❌ *cancelar* = encerrar`];
+  let resposta = txt.trim();
+  if (tipo === 'estadoCivil') resposta = validarEstadoCivil(resposta).valor;
+  if (tipo === 'telefone') resposta = formatarTelefone(resposta);
+  if (tipo === 'emailOpcional' && /^não informado$/i.test(resposta)) resposta = 'Não informado';
+  if (tipo === 'uf') resposta = resposta.toUpperCase();
+  if (tipo === 'cpf') resposta = resposta.replace(/\D/g, '');
+  if (['opcional','emailOpcional'].includes(tipo) && /^(não|nao|n|nenhum|sem complemento|pular|skip)$/i.test(resposta)) resposta = 'Não informado';
+  if (tipo === 'tipoImovel') resposta = ({'1':'Casa','2':'Apartamento','3':'Outro'})[resposta];
+  if (tipo === 'finalidade') resposta = ({'1':'Residencial','2':'Comercial'})[resposta];
+  if (tipo === 'mobiliado') resposta = ({'1':'Sim, mobiliado','2':'Não','3':'Parcialmente mobiliado'})[resposta];
+  if (tipo === 'formaPagamento') resposta = ({'1':'Pix','2':'Transferência/depósito bancário'})[resposta];
+  if (tipo === 'garantia') resposta = ({'1':'Nenhuma','2':'Caução','3':'Fiador','4':'Seguro-fiança'})[resposta];
+  if (tipo === 'caucaoDestino') resposta = ({'1':'Devolução integral ao locatário, desde que não existam débitos ou danos ao imóvel.','2':'Devolução do valor restante após o desconto de eventuais débitos, danos ou outras obrigações previstas no contrato.','3':'Outra forma de devolução, conforme acordado entre locador e locatário.'})[resposta];
+  if (tipo === 'condicoes') resposta = resposta === '0' ? ['Nenhuma condição adicional informada'] : [...new Set(resposta.split(/[,;\s]+/).map(n => ({'1':'Pets/animais','2':'Som alto e perturbação do sossego','3':'Mudanças e movimentação de móveis','4':'Uso de áreas comuns','5':'Reformas/alterações','6':'Proibição de sublocação sem autorização','7':'Outra condição'}[n])))];
+  a[key] = resposta;
+  // Quando o cliente informar que o imóvel é o mesmo endereço residencial,
+  // copiar os campos para o endereço do imóvel assim que o endereço do locatário
+  // for preenchido (o imóvel ainda não foi coletado neste ponto do fluxo).
+  if ((key === 'locatario_cep' || key === 'enderecoImovelIgualLocatario') && /^(1|sim|s)$/i.test(String(a.enderecoImovelIgualLocatario || ''))) {
+    a.enderecoImovel = a.locatario_endereco || '';
+    a.numeroImovel = a.locatario_numero || '';
+    a.complementoImovel = a.locatario_complemento || '';
+    a.bairroImovel = a.locatario_bairro || '';
+    a.cidadeImovel = a.locatario_cidade || '';
+    a.estadoImovel = a.locatario_estado || '';
+    a.cepImovel = a.locatario_cep || '';
+  }
+  if (key === 'dataInicio' || key === 'prazo') {
+    if (a.dataInicio && a.prazo) {
+      const [dd,mm,yyyy] = a.dataInicio.split('/').map(Number);
+      const fim = new Date(yyyy, mm - 1, dd);
+      fim.setMonth(fim.getMonth() + Number(a.prazo));
+      if (fim.getDate() !== dd) fim.setDate(0);
+      a.dataFim = `${String(fim.getDate()).padStart(2,'0')}/${String(fim.getMonth()+1).padStart(2,'0')}/${fim.getFullYear()}`;
+    }
+  }
+  const atualizadas = perguntasContrato(s.data, s.contratoCorrecaoChaves);
+  // A lista de perguntas é condicional. Localize a pergunta respondida na
+  // lista recalculada antes de avançar, para não pular perguntas quando uma
+  // ramificação (por exemplo, segundo locador ou caução) não se aplica.
+  const indiceAtualizado = atualizadas.findIndex(([perguntaKey]) => perguntaKey === key);
+  const nextIndex = indiceAtualizado >= 0 ? indiceAtualizado + 1 : idx;
+  if (nextIndex < atualizadas.length) {
+    s.contratoIndex = nextIndex;
+    return [perguntaContratoNumerada(atualizadas, nextIndex) + '\n\n↩️ *voltar* = pergunta anterior | ❌ *cancelar* = encerrar'];
+  }
+  s.contratoCorrecaoChaves = null;
+  const exibir = (v) => Array.isArray(v) ? v.join(', ') : (v || 'Não informado');
+  const complementoSeExiste = (v) => v && !/^não informado$/i.test(String(v).trim()) ? `, ${String(v).trim()}` : '';
+  const enderecoLocador = `${exibir(a.locador_endereco)}, nº ${exibir(a.locador_numero)}${complementoSeExiste(a.locador_complemento)}, ${exibir(a.locador_bairro)}, ${exibir(a.locador_cidade)}/${exibir(a.locador_estado)}, CEP ${exibir(a.locador_cep)}`;
+  const enderecoLocatario = `${exibir(a.locatario_endereco)}, nº ${exibir(a.locatario_numero)}${complementoSeExiste(a.locatario_complemento)}, ${exibir(a.locatario_bairro)}, ${exibir(a.locatario_cidade)}/${exibir(a.locatario_estado)}, CEP ${exibir(a.locatario_cep)}`;
+  const enderecoImovelFinal = `${exibir(a.enderecoImovel)}, nº ${exibir(a.numeroImovel)}${complementoSeExiste(a.complementoImovel)}, ${exibir(a.bairroImovel)}, ${exibir(a.cidadeImovel)}/${exibir(a.estadoImovel)}, CEP ${exibir(a.cepImovel)}`;
+  const resumo = `📄 *SOLICITAÇÃO DE CONTRATO DE LOCAÇÃO*
 
-  sessions.delete(jid)
+` +
+    `*LOCADOR:* ${exibir(a.locador_nome)} | Nascimento ${exibir(a.locador_nascimento)} | CPF ${exibir(a.locador_cpf)} | RG ${exibir(a.locador_rg)} | ${exibir(a.locador_estadoCivil)} | ${exibir(a.locador_nacionalidade)}
+` +
+    `*Endereço do locador:* ${enderecoLocador}
+` +
+    `*Contato do locador:* ${exibir(a.locador_telefone)} | ${exibir(a.locador_email)}\n` +
+    (/^(1|sim|s)$/i.test(String(a.outroLocador || '')) ? (/^(1|sim|s)$/i.test(String(a.locador2_conjuge || '')) ? `\n*SEGUNDO LOCADOR (CÔNJUGE):* ${exibir(a.locador2_nome)} | CPF ${exibir(a.locador2_cpf)} | RG ${exibir(a.locador2_rg)}\n` : `\n*SEGUNDO LOCADOR:* ${exibir(a.locador2_nome)} | Nascimento ${exibir(a.locador2_nascimento)} | CPF ${exibir(a.locador2_cpf)} | RG ${exibir(a.locador2_rg)} | ${exibir(a.locador2_estadoCivil)} | ${exibir(a.locador2_nacionalidade)}\n*Endereço do segundo locador:* ${exibir(a.locador2_endereco)}\n*Contato do segundo locador:* ${exibir(a.locador2_telefone)} | ${exibir(a.locador2_email)}\n`) : '') + `\n` +
+    `*LOCATÁRIO:* ${exibir(a.locatario_nome)} | Nascimento ${exibir(a.locatario_nascimento)} | CPF ${exibir(a.locatario_cpf)} | RG ${exibir(a.locatario_rg)} | ${exibir(a.locatario_estadoCivil)} | ${exibir(a.locatario_nacionalidade)}
+` +
+    `*Endereço do locatário:* ${enderecoLocatario}
+` +
+    `*Contato do locatário:* ${exibir(a.locatario_telefone)} | ${exibir(a.locatario_email)}\n` +
+    (/^(1|sim|s)$/i.test(String(a.outroLocatario || '')) ? (/^(1|sim|s)$/i.test(String(a.locatario2_conjuge || '')) ? `\n*SEGUNDO LOCATÁRIO (CÔNJUGE):* ${exibir(a.locatario2_nome)} | CPF ${exibir(a.locatario2_cpf)} | RG ${exibir(a.locatario2_rg)}\n` : `\n*SEGUNDO LOCATÁRIO:* ${exibir(a.locatario2_nome)} | Nascimento ${exibir(a.locatario2_nascimento)} | CPF ${exibir(a.locatario2_cpf)} | RG ${exibir(a.locatario2_rg)} | ${exibir(a.locatario2_estadoCivil)} | ${exibir(a.locatario2_nacionalidade)}\n*Endereço do segundo locatário:* ${exibir(a.locatario2_endereco)}\n*Contato do segundo locatário:* ${exibir(a.locatario2_telefone)} | ${exibir(a.locatario2_email)}\n`) : '') + `\n` +
+    `*IMÓVEL:* ${exibir(a.tipoImovel)} ${a.garagem === 'sim' || a.garagem === '1' ? 'com garagem' : 'sem garagem'}, localizado à ${enderecoImovelFinal}, para fins ${String(a.finalidade || '').toLowerCase()}
+` +
+    `*Finalidade:* ${exibir(a.finalidade)} | *Mobiliado:* ${exibir(a.mobiliado)}${a.descricaoMoveis ? ' — ' + a.descricaoMoveis : ''}
+` +
+    `*Prazo:* ${exibir(a.prazo)} meses | *Início:* ${exibir(a.dataInicio)} | *Término calculado:* ${exibir(a.dataFim)}
+` +
+    `*Aluguel:* R$ ${exibir(a.aluguel)} | *Vencimento:* dia ${exibir(a.vencimento)}
+` +
+    `*Pagamento:* ${exibir(a.pagamento)}${a.pix ? ' — Pix: ' + a.pix : ''}${a.banco ? ' — Banco: ' + a.banco + ', agência ' + exibir(a.agencia) + ', conta ' + exibir(a.conta) + ', titular ' + exibir(a.titularConta) : ''}
+` +
+    `*Garantia:* ${exibir(a.garantia)}${a.caucaoValor ? ' — R$ ' + a.caucaoValor + '; tratamento: ' + exibir(a.caucaoDestino) + (a.caucaoOutraForma ? '; outra forma informada: ' + a.caucaoOutraForma : '') : ''}${a.fiador_nome ? ' — Fiador: ' + a.fiador_nome + ', CPF ' + exibir(a.fiador_cpf) + ', RG ' + exibir(a.fiador_rg) + ', endereço ' + exibir(a.fiador_endereco) + ', telefone ' + exibir(a.fiador_telefone) : ''}${a.seguroDados ? ' — ' + a.seguroDados : ''}
+` +
+    `*Condições/restrições:* ${exibir(a.condicoes)}${a.outraCondicao ? ' — ' + a.outraCondicao : ''}
+
+` +
+    `⚠️ *Conferência necessária:* cadastro para preparação do contrato; revisar dados e cláusulas antes da assinatura.`;
+  s.step = 'contrato_confirmacao';
+  s.contratoResumo = resumo;
+  return [`✅ *Preenchimento concluído!*\n\nSeus dados foram registrados. Para proteger suas informações pessoais, o resumo completo não será exibido nesta conversa.\n\nO que deseja fazer?\n\n*1.* Confirmar e enviar os dados\n*2.* Corrigir respostas anteriores\n*3.* Cancelar`,];
 }
 
-// ---------- PAINEL WEB ----------
-
-function autorizado(req) {
-  if (!ADMIN_TOKEN) return true
-  const token = req.query.token || req.headers['x-admin-token']
-  return token === ADMIN_TOKEN
+// ======================================================
+// PONTE V7: fila temporária (sem banco de dados)
+// Pedidos não sobrevivem a reinicialização do Render.
+// ======================================================
+const bridgeToken = process.env.V7_BRIDGE_TOKEN || '';
+const bridgeJobs = new Map();
+let bridgeSeen = 0;
+const BRIDGE_TTL = 75 * 1000;
+const BRIDGE_MAX_PDF = 7 * 1024 * 1024;
+const BRIDGE_LEASE_MS = 120000;
+const BRIDGE_JOB_TTL_MS = 5 * 60 * 1000;
+const BRIDGE_MAX_ATTEMPTS = 2;
+function bridgeAuth(req, res, next) {
+  const provided = req.get('X-V7-Token') || '';
+  if (bridgeToken.length < 32 || !compararSeguramente(provided, bridgeToken))
+    return res.status(401).json({error:'Não autorizado'});
+  next();
+}
+function bridgeOnline() { return bridgeToken.length >= 32 && Date.now() - bridgeSeen < BRIDGE_TTL; }
+const lidPhones = new Map();
+function bridgePhone(jid) {
+  if (typeof jid !== 'string') return null;
+  let phoneJid = jid;
+  if (jid.endsWith('@lid')) {
+    const entry = lidPhones.get(jid);
+    if (!entry || Date.now() - entry.at > 4 * 60 * 60 * 1000) {
+      lidPhones.delete(jid);
+      return null;
+    }
+    phoneJid = entry.phoneJid;
+  }
+  if (!phoneJid.endsWith('@s.whatsapp.net')) return null;
+  const n = phoneJid.split('@')[0].split(':')[0];
+  return /^\d{10,15}$/.test(n) ? n : null;
+}
+async function bridgeResolveLid(sock, message) {
+  const jid = message.key?.remoteJid;
+  if (!jid?.endsWith('@lid')) return;
+  const mapping = sock.signalRepository?.lidMapping;
+  let candidate = message.key?.remoteJidAlt;
+  if (!candidate?.endsWith('@s.whatsapp.net') && typeof mapping?.getPNForLID === 'function') {
+    try { candidate = await mapping.getPNForLID(jid); }
+    catch (_) { candidate = null; }
+  }
+  if (typeof candidate !== 'string' || !candidate.endsWith('@s.whatsapp.net')) return;
+  const n = candidate.split('@')[0].split(':')[0];
+  if (!/^\d{10,15}$/.test(n)) return;
+  lidPhones.set(jid, {phoneJid: candidate, at: Date.now()});
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  }[c]))
+function bridgeClean() {
+  const now = Date.now();
+  for (const [id, job] of bridgeJobs) {
+    if (now - job.created > BRIDGE_JOB_TTL_MS) bridgeJobs.delete(id);
+  }
+}
+setInterval(bridgeClean, 30000).unref();
+app.get('/v7bridge/jobs', bridgeAuth, (req,res) => {
+  bridgeSeen = Date.now();
+  const now = Date.now();
+  const jobs = [];
+  for (const job of bridgeJobs.values()) {
+    if (now - job.created > BRIDGE_JOB_TTL_MS) {
+      bridgeJobs.delete(job.id);
+      continue;
+    }
+    if (job.status === 'leased' && now >= job.leaseUntil) {
+      // Uma tentativa expirada pode ter sido concluída no computador antigo.
+      // Só reenfileirar se a etapa de envio NÃO tiver começado.
+      job.status = (job.attempts || 0) < BRIDGE_MAX_ATTEMPTS ? 'pending' : 'expired';
+      job.leaseToken = null;
+    }
+    if (job.status !== 'pending' || jobs.length >= 3) continue;
+    job.attempts = (job.attempts || 0) + 1;
+    job.status = 'leased'; job.leaseUntil = now + BRIDGE_LEASE_MS; job.leaseToken = crypto.randomUUID();
+    jobs.push({id:job.id,jid:job.jid,phone:job.phone,name:job.name,cpf4:job.cpf4,leaseToken:job.leaseToken});
+  }
+  res.json(jobs);
+});
+app.post('/v7bridge/result/:id', bridgeAuth, async (req,res) => {
+  const job = bridgeJobs.get(req.params.id);
+  if (!job || job.status !== 'leased' ||
+    Date.now() >= job.leaseUntil ||
+    typeof req.body?.leaseToken !== 'string' ||
+    !compararSeguramente(req.body.leaseToken, job.leaseToken)) {
+    return res.status(409).json({error:'Reserva inválida ou expirada'});
+  }
+  // Consumo atômico antes do primeiro await: uma única tentativa de envio.
+  // Se o WhatsApp falhar, não reenviar automaticamente (evita duplicidade).
+  job.status = 'consumed';
+  const b64 = req.body?.pdfBase64;
+  let status = 'denied';
+  try {
+    if (typeof b64 !== 'string' || b64.length > Math.ceil(BRIDGE_MAX_PDF * 4 / 3) + 16 || !/^[A-Za-z0-9+/]+={0,2}$/.test(b64)) {
+      if (req.body?.error) log('Ponte V7: solicitação recusada pelo worker');
+      await whatsappSock?.sendMessage(job.jid, {text:'Não foi possível liberar o documento. Procure o atendimento da V7Cyber.'});
+    } else {
+      const pdf = Buffer.from(b64,'base64');
+      if (pdf.length > BRIDGE_MAX_PDF || pdf.subarray(0,5).toString() !== '%PDF-') throw Error('PDF inválido');
+      if (!isConnected || !whatsappSock) throw Error('WhatsApp desconectado');
+      await whatsappSock.sendMessage(job.jid, {document:pdf,mimetype:'application/pdf',fileName:'curriculo.pdf',caption:'Seu currículo em PDF — V7Cyber'});
+      status = 'sent';
+    }
+  } catch (e) { log('Ponte V7: falha no envio: '+e.message); status = 'failed'; }
+  finally { bridgeJobs.delete(job.id); }
+  res.json({status});
+});
+// ======================================================
+// MOTOR DO BOT
+// ======================================================
+async function processarMensagem(jid, txt) {
+  const lower = txt.toLowerCase().trim();
+  const respostas = [];
+  const s = getSession(jid);
+  const d = s.data;
+  const agora = Date.now();
+
+  // Após 4 horas sem interação, o menu reaparece na próxima mensagem,
+  // desde que não exista cadastro ativo em andamento.
+  if (
+    s.step === 'idle' &&
+    s.lastActivityAt &&
+    agora - s.lastActivityAt >= LIMITE_INATIVIDADE_MS
+  ) {
+    s.menuExibido = false;
+    s.menuPendente = false;
+  }
+  s.lastActivityAt = agora;
+
+  if (s.step === 'pdf_nome') {
+    if (['cancelar','sair','menu'].includes(lower)) { sessions.delete(jid); return [menuPrincipal()]; }
+    if (txt.trim().length < 5 || txt.trim().split(/\s+/).length < 2 || txt.length > 120) return ['Informe seu nome completo ou digite *cancelar*.'];
+    s.pdfNome = txt.trim(); s.step = 'pdf_cpf';
+    return ['Digite somente os *4 últimos números do seu CPF* (conferência complementar).'];
+  }
+  if (s.step === 'pdf_cpf') {
+    if (['cancelar','sair','menu'].includes(lower)) { sessions.delete(jid); return [menuPrincipal()]; }
+    if (!/^\d{4}$/.test(txt.trim())) return ['Informe exatamente 4 números ou digite *cancelar*.'];
+    const phone = bridgePhone(jid);
+    if (!phone || !bridgeOnline() || !isConnected) { sessions.delete(jid); return ['O envio de PDF está temporariamente indisponível. Tente novamente durante nosso horário de atendimento.']; }
+    if ([...bridgeJobs.values()].some(j=>j.jid===jid)) { sessions.delete(jid); return ['Você já tem uma solicitação em andamento. Aguarde alguns instantes.']; }
+    const id = crypto.randomUUID();
+    bridgeJobs.set(id,{id,jid,phone,name:s.pdfNome,cpf4:txt.trim(),status:'pending',created:Date.now()});
+    sessions.delete(jid);
+    return ['Solicitação recebida. Se seu número estiver previamente autorizado, tentaremos enviar seu PDF em instantes.'];
+  }
+  // ======================================================
+  // MENU INICIAL
+  // Qualquer primeira mensagem mostra o menu.
+  // Os números 1/2/3/4 só são opções logo após o menu ser exibido.
+  // Fora desse momento, todos os números seguem como conversa normal.
+  // ======================================================
+
+  if (s.step === 'idle') {
+    if (['menu', 'voltar', 'inicio', 'início'].includes(lower)) {
+      s.menuExibido = true;
+      s.menuPendente = true;
+      return [menuPrincipal()];
+    }
+
+    if (s.menuPendente && ['1','2','3','6'].includes(lower)) {
+      s.menuPendente = false;
+      return [respostaMenu(lower)];
+    }
+
+    if (s.menuPendente && lower === '7') {
+      if (!bridgePhone(jid) || !bridgeOnline() || !isConnected) {
+        s.menuPendente = false;
+        return ['O envio de PDF está temporariamente indisponível. Tente novamente durante nosso horário de atendimento.'];
+      }
+      s.step = 'pdf_nome'; s.menuPendente = false;
+      return ['📄 *SOLICITAR CURRÍCULO EM PDF*\n\nInforme seu nome completo. O envio exige autorização prévia do atendimento.\nDigite *cancelar* para sair.'];
+    }
+    if (s.menuPendente && lower === '4') {
+      return [iniciarContrato(jid)];
+    }
+
+    if (s.menuPendente && lower === '5') {
+      sessions.set(jid, {
+        step:'nome', menuExibido:true, menuPendente:false,
+        lastActivityAt:Date.now(), data:{ experiencias:[], cursos:[] },
+        expTemp:{}, cursoTemp:{}
+      });
+      return [`👋 Olá! Sou o Robô da Conexão v7cyber 🤖\n\nVamos montar seu currículo profissional!\n\n💡 Digite *sair* ou *cancelar* para cancelar.\n\n1️⃣ Qual seu nome e sobrenome completo?`];
+    }
+
+    const gatilhoInicial = lower.includes('criar curriculum') || lower.includes('criar curriculo') || lower.includes('criar currículo') || (lower.includes('criar') && lower.includes('curric')) || lower === 'curriculo' || lower === 'curriculum';
+    if (gatilhoInicial) {
+      sessions.set(jid, { step:'nome', menuExibido:true, menuPendente:false, lastActivityAt:Date.now(), data:{ experiencias:[], cursos:[] }, expTemp:{}, cursoTemp:{} });
+      return [`👋 Olá! Vamos montar seu currículo profissional!\n\nDigite *sair* ou *cancelar* para cancelar.\n\n1️⃣ Qual seu nome e sobrenome completo?`];
+    }
+
+    if (!s.menuExibido) {
+      s.menuExibido = true;
+      s.menuPendente = true;
+      return [menuPrincipal()];
+    }
+    s.menuPendente = false;
+    return [];
+  }
+
+  // Volta uma pergunta no cadastro, mantendo os dados já digitados.
+  if (lower === 'voltar' && s.step !== 'idle' && s.step !== 'menu_temporario') {
+    if (s.step === 'contrato') {
+      s.contratoIndex = Math.max(0, (s.contratoIndex || 0) - 1);
+      const qAnterior = perguntasContrato(s.data)[s.contratoIndex];
+      return [qAnterior ? `↩️ Voltando.\n\n${qAnterior[1]}` : 'Você já está na primeira pergunta do contrato.'];
+    }
+    const etapasCurriculo = ['nome','nascimento','nacionalidade','estadoCivil','rua','numero','complemento','bairro','cidade','estado','cep','telefone','email','objetivo','exp_empresa','exp_cargo','exp_inicio','exp_fim','exp_mais','formacao','curso_pergunta','curso_nome','curso_inst','curso_ano','curso_mais','habilidades','resumo'];
+    const pos = etapasCurriculo.indexOf(s.step);
+    if (pos > 0) {
+      s.step = etapasCurriculo[pos - 1];
+      const perguntasPorEtapa = {
+        nome:'Qual seu nome e sobrenome completo?', nascimento:'Data de nascimento?\nFormato DD/MM/AAAA', nacionalidade:'Qual sua nacionalidade?', estadoCivil:'Qual seu estado civil?', rua:'Nome da rua/avenida?', numero:'Número da casa?', complemento:'Complemento? Se não tiver, digite não.', bairro:'Qual seu bairro?', cidade:'Qual sua cidade?', estado:'Estado (sigla de 2 letras)?', cep:'Qual seu CEP?', telefone:'Qual seu telefone/WhatsApp?', email:'Qual seu e-mail?', objetivo:'Qual seu objetivo profissional?', exp_empresa:'Nome da última empresa? Se for primeiro emprego, digite primeiro emprego.', exp_cargo:'Qual era seu cargo?', exp_inicio:'Data de início do trabalho?', exp_fim:'Data de saída? Ou digite atual.', exp_mais:'Tem mais empresas? 1 Sim, 2 Não, 3 Pular', formacao:'Qual sua formação?', curso_pergunta:'Tem cursos? 1 Sim, 2 Não, 3 Pular', curso_nome:'Qual o nome do curso?', curso_inst:'Onde fez o curso?', curso_ano:'Qual o ano do curso?', curso_mais:'Mais cursos? 1 Sim, 2 Não, 3 Pular', habilidades:'Informe suas habilidades ou digite pular.', resumo:'Informe seu resumo profissional ou digite pular.'
+      };
+      return [`↩️ Voltando à pergunta anterior.\n\n${perguntasPorEtapa[s.step] || 'Continue o cadastro.'}`];
+    }
+    return ['Você já está na primeira pergunta.'];
+  }
+
+  // Durante cadastro, permite consultar o menu sem apagar os dados já preenchidos.
+  if (['menu','inicio','início'].includes(lower) && s.step !== 'idle') {
+    s.stepAntesMenu = s.step;
+    s.step = 'menu_temporario';
+    s.menuPendente = true;
+    return [menuPrincipal()];
+  }
+  if (s.step === 'menu_temporario') {
+    const etapaAnterior = s.stepAntesMenu || 'idle';
+    // Reconhece todas as etapas do contrato, inclusive confirmação e correção.
+    const cadastroAnterior = String(etapaAnterior).startsWith('contrato') ? 'contrato' : 'curriculo';
+
+    if (lower === '4') {
+      if (cadastroAnterior === 'contrato') {
+        s.step = etapaAnterior;
+        if (etapaAnterior === 'contrato_confirmacao') {
+          return ['📄 *CONTRATO PREENCHIDO*\n\n*1.* Confirmar e enviar\n*2.* Corrigir respostas anteriores\n*3.* Cancelar'];
+        }
+        if (etapaAnterior === 'contrato_correcao_menu') {
+          return ['✏️ *O que deseja corrigir?*\n\n*1.* Dados do locador\n*2.* Dados do locatário\n*3.* Imóvel e condições\n*4.* Prazo, aluguel e pagamento\n*5.* Garantia (caução, fiador ou seguro)\n\nDigite o número do grupo.'];
+        }
+        const qs = perguntasContrato(s.data, s.contratoCorrecaoChaves);
+        return [perguntaContratoNumerada(qs, s.contratoIndex || 0) + '\n\n↩️ *voltar* = pergunta anterior | ❌ *cancelar* = encerrar'];
+      }
+      s.step = etapaAnterior;
+      return ['Você tem um currículo em andamento. Para iniciar um contrato, primeiro digite *cancelar*. Seu currículo foi preservado.'];
+    }
+
+    if (lower === '5') {
+      if (cadastroAnterior === 'curriculo') {
+        s.step = etapaAnterior;
+        return ['Retomando o cadastro do currículo. Continue respondendo à pergunta pendente ou digite *voltar*.'];
+      }
+      s.step = etapaAnterior;
+      return ['Você tem um contrato em andamento. Para iniciar um currículo, primeiro digite *cancelar*. Seu contrato foi preservado.'];
+    }
+
+    if (lower === '7') { s.step = etapaAnterior; return ['Para solicitar um PDF, finalize ou cancele o cadastro atual e volte ao menu.']; }
+    if (lower === '6') { s.step = etapaAnterior; return [respostaMenu('6')]; }
+    if (['1','2','3'].includes(lower)) { s.step = etapaAnterior; return [respostaMenu(lower), 'Seu cadastro foi preservado. Continue respondendo à pergunta pendente ou digite *menu* para consultar as opções.']; }
+    if (lower === 'voltar') { s.step = etapaAnterior; return ['Retomando o cadastro anterior. Continue respondendo à pergunta pendente.']; }
+    return ['Digite uma opção de 1 a 7, ou *voltar* para retomar o cadastro.'];
+  }
+
+  const sair = [
+    'sair','cancelar','parar','desistir',
+    'exit','cancel','stop','sai','cancela'
+  ];
+
+  if (
+    sair.includes(lower) ||
+    lower.includes('quero sair') ||
+    lower.includes('quero cancelar')
+  ) {
+    sessions.delete(jid);
+    return ['❌ Cadastro cancelado com sucesso!\n\nSe quiser recomeçar, digite *menu* e escolha uma opção'];
+  }
+
+  if (s.step === 'contrato' || s.step === 'contrato_confirmacao') return processarContrato(s, txt, jid);
+
+  const gatilho =
+    lower.includes('criar curriculum') ||
+    lower.includes('criar curriculo') ||
+    lower.includes('criar currículo') ||
+    (lower.includes('criar') && lower.includes('curric')) ||
+    lower === 'curriculo' ||
+    lower === 'curriculum';
+
+  if (gatilho) {
+    sessions.set(jid, {
+      step:'nome',
+      data:{ experiencias:[], cursos:[] },
+      expTemp:{},
+      cursoTemp:{}
+    });
+
+    return [`👋 Olá! Sou o Robô da Conexão v7cyber 🤖
+
+Vamos montar seu currículo profissional!
+
+💡 A qualquer momento digite *sair* ou *cancelar* para cancelar.
+
+1️⃣ Qual seu nome e sobrenome completo?`];
+  }
+
+  if (s.step === 'idle')
+    return [];
+
+  if (s.step === 'nome') {
+    if (txt.split(/\s+/).length < 2)
+      return ['⚠️ Digite nome e sobrenome completo.\nEx: João Silva'];
+
+    d.nome = txt;
+    s.step = 'nascimento';
+    return ['2️⃣ Data de nascimento?\n\n📅 Formato: DD/MM/AAAA\nEx: 15/03/1998'];
+  }
+
+  if (s.step === 'nascimento') {
+    const v = validarDataNascimento(txt);
+    if (!v.ok) return [`⚠️ ${v.erro}\n\nUse DD/MM/AAAA.`];
+
+    d.dataNascimento = txt;
+    d.idade = v.idade;
+    s.step = 'nacionalidade';
+    return ['3️⃣ Nacionalidade?\nEx: Brasileiro'];
+  }
+
+  if (s.step === 'nacionalidade') {
+    d.nacionalidade = txt;
+    s.step = 'estadoCivil';
+    return ['4️⃣ Estado civil?\n\nEx: Solteiro, Casado, Divorciado ou União Estável'];
+  }
+
+  if (s.step === 'estadoCivil') {
+    const v = validarEstadoCivil(txt);
+    if (!v.ok)
+      return ['⚠️ Estado civil não reconhecido.\nDigite Solteiro, Casado, Divorciado, Viúvo, Separado ou União Estável.'];
+
+    d.estadoCivil = v.valor;
+    s.step = 'rua';
+    return ['5️⃣ Nome da RUA / Avenida?\nEx: Rua das Flores'];
+  }
+
+  if (s.step === 'rua') {
+    d.rua = txt;
+    s.step = 'numero';
+    return ['6️⃣ NÚMERO da casa?\nEx: 123'];
+  }
+
+  if (s.step === 'numero') {
+    d.numero = txt;
+    s.step = 'complemento';
+    return ['7️⃣ COMPLEMENTO?\n\nEx: Apto 101, Bloco B\nSe não tiver, digite *não*'];
+  }
+
+  if (s.step === 'complemento') {
+    d.complemento = ['não','nao','sem','n','nenhum'].includes(lower) ? '' : txt;
+    s.step = 'bairro';
+    return ['8️⃣ BAIRRO?\nEx: Centro'];
+  }
+
+  if (s.step === 'bairro') {
+    d.bairro = txt;
+    s.step = 'cidade';
+    return ['9️⃣ CIDADE?\nEx: São Paulo'];
+  }
+
+  if (s.step === 'cidade') {
+    d.cidade = txt;
+    s.step = 'estado';
+    return ['🔟 ESTADO (sigla 2 letras)?\nEx: SP, RJ, MG'];
+  }
+
+  if (s.step === 'estado') {
+    if (txt.length !== 2)
+      return ['⚠️ Digite somente a sigla com 2 letras.\nEx: SP'];
+
+    d.estado = txt.toUpperCase();
+    s.step = 'cep';
+    return ['1️⃣1️⃣ CEP?\n\nFormato: 00000-000\nEx: 08500-000\n\nPode digitar só números: 08500000'];
+  }
+
+  if (s.step === 'cep') {
+    const cep = formatarCEP(txt);
+    if (!validarCEP(cep))
+      return ['⚠️ CEP inválido!\nEx: 08500-000'];
+
+    d.cep = cep;
+    s.step = 'telefone';
+    return ['1️⃣2️⃣ TELEFONE / WhatsApp?\n\nEx: (11) 94204-7248\nPode digitar só números: 11942047248'];
+  }
+
+  if (s.step === 'telefone') {
+    let tel = txt;
+    const fmt = formatarTelefone(txt);
+    if (fmt) tel = fmt;
+
+    if (!validarTelefone(tel))
+      return ['⚠️ Telefone inválido!\nEx: (11) 94204-7248'];
+
+    d.telefone = tel;
+    s.step = 'email';
+    return ['1️⃣3️⃣ EMAIL?\n\nEx: joao@gmail.com'];
+  }
+
+  if (s.step === 'email') {
+    const email = txt.toLowerCase().trim();
+    if (!validarEmail(email))
+      return ['⚠️ Email inválido!\nEx: joao@gmail.com'];
+
+    d.email = email;
+    s.step = 'objetivo';
+    return ['1️⃣4️⃣ Objetivo profissional?\n\nEx: Auxiliar administrativo, Vendedor, Motorista'];
+  }
+
+  if (s.step === 'objetivo') {
+    d.objetivo = txt;
+    s.step = 'exp_empresa';
+    return ['1️⃣5️⃣ Nome da última empresa?\n\nSe for seu primeiro emprego digite *primeiro emprego*'];
+  }
+
+  if (s.step === 'exp_empresa') {
+    if (lower.includes('primeiro')) {
+      d.experiencias = [];
+      s.step = 'formacao';
+      return ['Primeiro emprego 💪\n\nQual sua formação?\nEx: Ensino médio completo, Superior em Administração'];
+    }
+
+    s.expTemp.empresa = txt;
+    s.step = 'exp_cargo';
+    return [`Cargo na ${txt}?`];
+  }
+
+  if (s.step === 'exp_cargo') {
+    s.expTemp.cargo = txt;
+    s.step = 'exp_inicio';
+    return ['Data INÍCIO?\nEx: 03/2022 ou 15/03/2022'];
+  }
+
+  if (s.step === 'exp_inicio') {
+    const v = validarDataExp(txt);
+    if (!v.ok) return [`⚠️ Data inválida!\n${v.erro}`];
+
+    s.expTemp.inicio = v.valor;
+    s.step = 'exp_fim';
+    return ['Data SAÍDA?\nEx: 12/2023\n\nOu digite *atual* se ainda trabalha lá.'];
+  }
+
+  if (s.step === 'exp_fim') {
+    const v = validarDataExp(txt);
+    if (!v.ok) return [`⚠️ Data inválida!\n${v.erro}`];
+
+    s.expTemp.fim = v.valor;
+    d.experiencias.push({...s.expTemp});
+    s.expTemp = {};
+    s.step = 'exp_mais';
+
+    return ['✅ Empresa adicionada!\n\nTem mais empresas?\n\n1️⃣ Sim\n2️⃣ Não\n3️⃣ Pular\n\nVocê também pode digitar sim ou não.'];
+  }
+
+  if (s.step === 'exp_mais') {
+    const escolha = respostaSimNao(txt);
+
+    if (escolha === 'sim') {
+      s.step = 'exp_empresa';
+      return ['Próxima empresa?'];
+    }
+
+    if (escolha === 'nao' || escolha === 'pular') {
+      s.step = 'formacao';
+      return ['Qual sua formação?'];
+    }
+
+    return ['⚠️ Opção inválida.\n\nDigite:\n1️⃣ Sim\n2️⃣ Não\n3️⃣ Pular'];
+  }
+
+  if (s.step === 'formacao') {
+    d.formacao = txt;
+    s.step = 'curso_pergunta';
+    return ['Tem cursos?\n\n1️⃣ Sim\n2️⃣ Não\n3️⃣ Pular\n\nVocê também pode digitar sim ou não.'];
+  }
+
+  if (s.step === 'curso_pergunta') {
+    const escolha = respostaSimNao(txt);
+
+    if (escolha === 'sim') {
+      s.step = 'curso_nome';
+      return ['Nome do curso?'];
+    }
+
+    if (escolha === 'nao' || escolha === 'pular') {
+      s.step = 'habilidades';
+      return ['💡 HABILIDADES - Opcional\n\nDigite suas habilidades ou *pular*.'];
+    }
+
+    return ['⚠️ Opção inválida.\n\nDigite:\n1️⃣ Sim\n2️⃣ Não\n3️⃣ Pular'];
+  }
+
+  if (s.step === 'curso_nome') {
+    s.cursoTemp.nome = txt;
+    s.step = 'curso_inst';
+    return [`Onde fez ${txt}?`];
+  }
+
+  if (s.step === 'curso_inst') {
+    s.cursoTemp.instituicao = txt;
+    s.step = 'curso_ano';
+    return ['Ano do curso?\nEx: 2023\n\nSe não lembrar, digite *não lembro*.'];
+  }
+
+  if (s.step === 'curso_ano') {
+    const la = lower;
+
+    if (la.includes('lembro') || la.includes('sei') || ['nao','não','n'].includes(la)) {
+      s.cursoTemp.ano = 'Não informado';
+    } else {
+      const v = validarAno(txt);
+      if (!v.ok) return [`⚠️ Ano inválido!\n${v.erro}`];
+      s.cursoTemp.ano = txt;
+    }
+
+    d.cursos.push({...s.cursoTemp});
+    s.cursoTemp = {};
+    s.step = 'curso_mais';
+
+    return ['✅ Curso adicionado!\n\nMais cursos?\n\n1️⃣ Sim\n2️⃣ Não\n3️⃣ Pular\n\nVocê também pode digitar sim ou não.'];
+  }
+
+  if (s.step === 'curso_mais') {
+    const escolha = respostaSimNao(txt);
+
+    if (escolha === 'sim') {
+      s.step = 'curso_nome';
+      return ['Próximo curso?'];
+    }
+
+    if (escolha === 'nao' || escolha === 'pular') {
+      s.step = 'habilidades';
+      return ['💡 HABILIDADES - Opcional\n\nDigite suas habilidades ou *pular*.'];
+    }
+
+    return ['⚠️ Opção inválida.\n\nDigite:\n1️⃣ Sim\n2️⃣ Não\n3️⃣ Pular'];
+  }
+
+  if (s.step === 'habilidades') {
+    d.habilidades =
+      ['pular','nao','não','n','sem','nenhum'].includes(lower) ||
+      lower.includes('pular') ? '' : txt;
+
+    s.step = 'resumo';
+    return ['📝 RESUMO PROFISSIONAL - Opcional\n\nDigite seu resumo ou *pular*.'];
+  }
+
+  if (s.step === 'resumo') {
+    d.resumo =
+      ['pular','nao','não','n','sem','nenhum'].includes(lower) ||
+      lower.includes('pular') ? '' : txt;
+
+    const curriculo = montarCurriculo(jid, d);
+
+    // Simulação do envio para o número administrador.
+    const registro = { id: crypto.randomUUID(), data: new Date().toLocaleString('pt-BR'), candidato: d.nome, jid, texto: curriculo };
+    adminMessages.push(registro);
+    if (adminMessages.length > 200) adminMessages.shift();
+
+    sessions.delete(jid);
+
+    return [
+      `✅ Obrigado, ${d.nome}!\n\nSeu currículo foi recebido com sucesso!\n\n💰 *Valor do currículo: R$ 10,00*\n\n📧 Email: ${d.email}\n📱 Tel: ${d.telefone}\n\n🚀 Conexão v7cyber agradece seu cadastro!`,
+      `__CURRICULO_ENVIADO__:${registro.id}`
+    ];
+  }
+
+  return [];
 }
 
+
+// ======================================================
+// WHATSAPP REAL — BAILEYS
+// ======================================================
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion
+} = require('@whiskeysockets/baileys');
+const QRCode = require('qrcode');
+const fs = require('fs');
+
+let qrCodeData = null;
+let isConnected = false;
+let whatsappSock = null;
+let logs = [];
+const processedMessageIds = new Set();
+
+// Somente silencia logs internos do Baileys. Não altera eventos, sessão ou reconexão.
+const whatsappLoggerSilencioso = {
+  level: 'silent',
+  child() { return this; },
+  trace() {}, debug() {}, info() {}, warn() {}, error() {}, fatal() {}
+};
+
+// Aceita ADMIN_JID no formato completo ou somente o número com DDI/DDD.
+// No Render, configure o número do administrador com DDI + DDD + número.
+const ADMIN_CONFIG = String(process.env.ADMIN_JID || '5511942047248').trim();
+const ADMIN_JID = ADMIN_CONFIG.includes('@')
+  ? ADMIN_CONFIG
+  : `${ADMIN_CONFIG.replace(/\D/g, '')}@s.whatsapp.net`;
+
+function escaparHtml(valor) {
+  return String(valor).replace(/[&<>\"']/g, caractere => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', "'": '&#39;'
+  })[caractere]);
+}
+
+function log(msg) {
+  const linha = `[${new Date().toLocaleString('pt-BR')}] ${msg}`;
+  console.log(linha);
+  logs.push(linha);
+  if (logs.length > 200) logs.shift();
+}
+
+async function iniciarWhatsApp() {
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState('./auth');
+
+    let version;
+    try {
+      version = (await fetchLatestBaileysVersion()).version;
+    } catch (e) {
+      version = undefined;
+    }
+
+    const sock = makeWASocket({
+      ...(version ? { version } : {}),
+      auth: state,
+      logger: whatsappLoggerSilencioso,
+      browser: ['Conexão v7cyber', 'Chrome', '1.0.0'],
+      markOnlineOnConnect: false
+    });
+
+    whatsappSock = sock;
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+      if (qr) {
+        qrCodeData = qr;
+        isConnected = false;
+        log('📱 QR Code gerado. Acesse /whatsapp para escanear.');
+      }
+
+      if (connection === 'open') {
+        isConnected = true;
+        qrCodeData = null;
+        log('✅ WhatsApp conectado - pronto para atendimento');
+      }
+
+      if (connection === 'close') {
+  isConnected = false;
+  qrCodeData = null;
+  whatsappSock = null;
+
+  const erro = lastDisconnect?.error;
+  const codigo = erro?.output?.statusCode;
+
+  log(`❌ Conexão encerrada. Código: ${codigo ?? 'não informado'}`);
+  // Mensagens brutas de erro podem conter JIDs/LIDs: não registrá-las.
+
+  if (codigo === 401) {
+    log('⚠️ Autenticação possivelmente inválida. Verifique a sessão antes de reconectar.');
+  }
+
+  setTimeout(() => iniciarWhatsApp(), 5000);
+}
+    });
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type && type !== 'notify') return;
+      for (const m of messages) {
+        try {
+          if (!m.message || m.key.fromMe) continue;
+          const messageId = m.key?.id;
+          if (messageId && processedMessageIds.has(messageId)) continue;
+          if (messageId) {
+            processedMessageIds.add(messageId);
+            if (processedMessageIds.size > 5000) {
+              const oldest = processedMessageIds.values().next().value;
+              if (oldest) processedMessageIds.delete(oldest);
+            }
+          }
+
+          const jid = m.key.remoteJid;
+          if (!jid || jid.endsWith('@g.us') || jid === 'status@broadcast') continue;
+          await bridgeResolveLid(sock, m);
+
+          const txt = (
+            m.message.conversation ||
+            m.message.extendedTextMessage?.text ||
+            ''
+          ).trim();
+
+          if (!txt) continue;
+
+          // Não registrar conteúdo, telefone, JID ou LID nos logs.
+
+          const replies = await processarMensagem(jid, txt);
+
+          for (const reply of replies) {
+            if (!reply) continue;
+
+            if (reply.startsWith('__CURRICULO_ENVIADO__:') || reply.startsWith('__CONTRATO_ENVIADO__:')) {
+              continue;
+            }
+
+            await sock.sendMessage(jid, { text: reply });
+          }
+
+          // Quando o currículo termina, processarMensagem já colocou
+          // o currículo na caixa adminMessages. Enviamos o último currículo
+          // para o número administrador.
+          const marcadores = replies.filter((reply) =>
+            reply.startsWith('__CURRICULO_ENVIADO__:') || reply.startsWith('__CONTRATO_ENVIADO__:')
+          );
+          for (const marcador of marcadores) {
+            const registroId = marcador.slice(marcador.indexOf(':') + 1);
+            const registro = adminMessages.find((item) => item.id === registroId);
+            if (!registro) {
+              log('❌ Referência de envio não encontrada.');
+              continue;
+            }
+            try {
+              log('📤 Enviando documento para o administrador.');
+              await sock.sendMessage(ADMIN_JID, { text: registro.texto });
+              log('✅ Documento enviado ao administrador.');
+            } catch (erroEnvio) {
+              log('❌ Falha ao enviar documento ao administrador.');
+              throw erroEnvio;
+            }
+          }
+        } catch (err) {
+          log('❌ Erro ao processar mensagem (conteúdo omitido).');
+        }
+      }
+    });
+
+  } catch (err) {
+    isConnected = false;
+    whatsappSock = null;
+    log('❌ Erro ao iniciar WhatsApp (detalhes privados omitidos).');
+    setTimeout(() => iniciarWhatsApp(), 5000);
+  }
+}
+
+// ======================================================
+// PAINEL WEB DO RENDER
+// ======================================================
 app.get('/', (req, res) => {
-  res.send(`<h1>Conexão v7cyber</h1><p>${isConnected ? '✅ CONECTADO' : '❌ Desconectado'}</p><a href="/whatsapp">QR WhatsApp</a> | <a href="/logs">Logs</a>`)
-})
+  res.send(`
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Conexão v7cyber</title>
+<style>
+body{font-family:Arial,sans-serif;background:#f0f2f5;text-align:center;padding:30px}
+.card{max-width:700px;margin:auto;background:white;padding:30px;border-radius:15px;box-shadow:0 3px 15px #bbb}
+.ok{color:green}.no{color:#b00020}
+a{display:inline-block;margin:8px;padding:12px 18px;background:#128c7e;color:white;text-decoration:none;border-radius:8px}
+pre{text-align:left;background:#eee;padding:15px;border-radius:8px;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>🤖 Conexão v7cyber</h1>
+<h2 class="${isConnected ? 'ok' : 'no'}">
+${isConnected ? '🟢 WhatsApp conectado' : '🔴 WhatsApp aguardando conexão'}
+</h2>
+<p><b>Administrador:</b> ${ADMIN_JID}</p>
+<a href="/whatsapp">📱 Conectar WhatsApp / QR Code</a>
+<a href="/logs">📋 Logs</a>
+<a href="/status">📊 Status</a>
+<pre>${escaparHtml(logs.slice(-20).join('\n'))}</pre>
+</div>
+</body>
+</html>
+  `);
+});
 
 app.get('/whatsapp', async (req, res) => {
   if (isConnected) {
-    return res.send(`<body style="text-align:center;font-family:Arial;padding:40px"><h1 style="color:green">✅ CONECTADO</h1><p>Bot rodando</p><p><b>Gatilho:</b> Criar Curriculum</p><a href="/logs">Logs</a></body>`)
+    return res.send(`
+      <body style="font-family:Arial;text-align:center;padding:40px">
+        <h1 style="color:green">✅ WhatsApp conectado</h1>
+        <p>O bot está funcionando.</p>
+        <a href="/">Voltar</a>
+        <pre style="text-align:left;background:#eee;padding:15px">${escaparHtml(logs.slice(-20).join('\n'))}</pre>
+      </body>
+    `);
   }
-  if (!qrCodeData) return res.send(`<h1>Aguardando QR...</h1><script>setTimeout(()=>location.reload(),3000)</script>`)
-  const img = await QRCode.toDataURL(qrCodeData)
-  res.send(`<body style="text-align:center;font-family:Arial"><h1>📱 Escaneie o QR</h1><img src="${img}" style="width:380px;border:10px solid #25D366;border-radius:20px"><script>setTimeout(()=>location.reload(),15000)</script></body>`)
-})
+
+  if (!qrCodeData) {
+    return res.send(`
+      <body style="font-family:Arial;text-align:center;padding:40px">
+        <h1>⏳ Aguardando QR Code...</h1>
+        <p>Esta página será atualizada automaticamente.</p>
+        <script>setTimeout(()=>location.reload(),3000)</script>
+      </body>
+    `);
+  }
+
+  const img = await QRCode.toDataURL(qrCodeData);
+
+  res.send(`
+    <body style="font-family:Arial;text-align:center;padding:30px">
+      <h1>📱 Conectar WhatsApp</h1>
+      <p>Abra o WhatsApp no celular → Aparelhos conectados → Conectar aparelho</p>
+      <img src="${img}" style="width:350px;max-width:90%;border:10px solid #25D366;border-radius:15px">
+      <p>Depois de escanear, aguarde a conexão.</p>
+      <a href="/">Voltar</a>
+      <script>setTimeout(()=>location.reload(),5000)</script>
+    </body>
+  `);
+});
 
 app.get('/qr', async (req, res) => {
-  if (!autorizado(req)) return res.status(401).send('Não autorizado')
-  if (isConnected) return res.send('<h1 style="color:green">✅ CONECTADO</h1>')
-  if (!qrCodeData) return res.send('<h1>Sem QR</h1>')
-  const img = await QRCode.toDataURL(qrCodeData)
-  res.send(`<body style="text-align:center"><h1>Escaneie</h1><img src="${img}" style="width:350px"><script>setTimeout(()=>location.reload(),20000)</script></body>`)
-})
+  if (isConnected) return res.send('<h1 style="color:green">✅ CONECTADO</h1>');
+  if (!qrCodeData) return res.send('<h1>⏳ Aguardando QR Code...</h1>');
+
+  const img = await QRCode.toDataURL(qrCodeData);
+  res.send(`
+    <body style="text-align:center;font-family:Arial">
+      <h1>📱 Escaneie o QR Code</h1>
+      <img src="${img}" style="width:350px">
+    </body>
+  `);
+});
 
 app.get('/status', (req, res) => {
-  if (!autorizado(req)) return res.status(401).json({ error: 'Não autorizado' })
-  res.json({ connected: isConnected, hasQR: !!qrCodeData, uptime: process.uptime() })
-})
+  res.json({
+    connected: isConnected,
+    hasQR: !!qrCodeData,
+    uptime: process.uptime(),
+    adminJid: ADMIN_JID
+  });
+});
 
 app.get('/logs', (req, res) => {
-  if (!ADMIN_TOKEN) return res.status(403).send('Configure ADMIN_TOKEN para consultar os logs.')
-  if (!autorizado(req)) return res.status(401).send('Não autorizado')
-  res.send(`<pre>${escapeHtml(logs.join('\n'))}</pre>`)
-})
+  res.send(`
+    <body style="font-family:Arial;padding:20px">
+      <h1>📋 Logs</h1>
+      <pre>${escaparHtml(logs.join('\n'))}</pre>
+      <a href="/">Voltar</a>
+    </body>
+  `);
+});
 
-// Limpa sessão APENAS quando explicitamente solicitado com token.
-// Para evitar apagar auth acidentalmente, o endpoint fica desabilitado sem ADMIN_TOKEN.
-app.get('/clear', (req, res) => {
-  if (!ADMIN_TOKEN) return res.status(403).send('Defina ADMIN_TOKEN para usar esta função.')
-  if (!autorizado(req)) return res.status(401).send('Não autorizado')
+app.get('/admin', (req, res) => {
+  res.json(adminMessages);
+});
 
-  try {
-    if (sockAtual) sockAtual.end?.(new Error('Sessão limpa pelo administrador'))
-  } catch (e) {}
-
-  try {
-    fs.rmSync(AUTH_DIR, { recursive: true, force: true })
-    fs.mkdirSync(AUTH_DIR, { recursive: true })
-  } catch (e) {
-    return res.status(500).send('Erro ao limpar sessão: ' + escapeHtml(e.message))
-  }
-
-  qrCodeData = null
-  isConnected = false
-  sockAtual = null
-  res.send('Sessão limpa. Recarregando conexão...')
-  starting = false
-  setTimeout(() => startBot().catch(e => log('Erro ao reiniciar WhatsApp após limpeza de sessão')), 1000)
-})
-
-startBot().catch(e => {
-  starting = false
-  log('❌ Erro ao inicializar bot')
-  agendarReconexao()
-})
-
-app.listen(PORT, () => log(`Rodando porta ${PORT} - Currículo flexível + Estado Civil + Voltar + Reconexão segura`))
-
+app.listen(PORT, () => {
+  log(`🚀 Servidor rodando na porta ${PORT}`);
+  log(`📱 QR Code: /whatsapp`);
+  log('📤 Destino administrativo configurado.');
+  iniciarWhatsApp();
+});
